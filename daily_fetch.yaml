@@ -1,0 +1,25 @@
+pipeline_name: "daily_nifty50_fetch"
+description: "Fetch daily OHLCV data for Nifty 50 stocks"
+
+data_source:
+  exchange: "NSE"
+  interval: "day"
+  instruments:
+    - "RELIANCE"
+    - "HDFCBANK"
+    - "TCS"
+    - "INFY"
+    - "ICICIBANK"
+    - "HINDUNILVR"
+    - "BAJFINANCE"
+    - "SBIN"
+    - "BHARTIARTL"
+    - "KOTAKBANK"
+
+date_range:
+  start: "2025-01-01"
+  end: "2026-04-09"
+
+retry:
+  max_attempts: 3
+  backoff_seconds: 2
