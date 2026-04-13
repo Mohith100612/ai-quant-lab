@@ -144,6 +144,10 @@ class WsTickerManager:
         self._ticks_dropped = 0
         self._ticks_stored  = 0
 
+        # 1-second throttle: instrument_token → last queued epoch timestamp
+        # Ensures at most one tick per symbol per second is stored.
+        self._last_tick_time: dict[int, float] = {}
+
         self._scheduler = BackgroundScheduler(timezone=IST)
 
     # -------------------------------------------------------------------------
@@ -517,21 +521,38 @@ class WsTickerManager:
         """
         Producer callback — must return immediately, never block.
 
+        Applies a 1-second per-symbol throttle: only the first tick received
+        for each instrument token within any 1-second window is queued; the
+        rest are silently discarded.  This satisfies the requirement to store
+        stock data at a 1-second interval.
+
         Uses put_nowait() so the WebSocket thread is never stalled by a
         full queue.  Dropped ticks are counted for monitoring.
         """
         if not ticks:
             return
+
+        now = time.time()
+        throttled = [
+            tick for tick in ticks
+            if now - self._last_tick_time.get(tick.get("instrument_token", 0), 0) >= 1.0
+        ]
+        for tick in throttled:
+            self._last_tick_time[tick.get("instrument_token", 0)] = now
+
+        if not throttled:
+            return
+
         try:
-            self._tick_queue.put_nowait(ticks)
+            self._tick_queue.put_nowait(throttled)
             self._last_tick_at = datetime.now(IST)
         except queue.Full:
-            self._ticks_dropped += len(ticks)
+            self._ticks_dropped += len(throttled)
             logger.warning(
                 "Tick queue full (%d/%d) — dropped %d tick(s). "
                 "Total dropped this session: %d",
                 self._tick_queue.qsize(), QUEUE_MAX_SIZE,
-                len(ticks), self._ticks_dropped,
+                len(throttled), self._ticks_dropped,
             )
 
     def _on_close(self, ws, code, reason) -> None:
