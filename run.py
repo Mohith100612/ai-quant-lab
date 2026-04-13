@@ -1,19 +1,21 @@
 """
 Unified entry point for ai-quant-lab.
 
-Dispatches to one of three modes:
+Dispatches to one of four modes:
 
   server    Start the FastAPI HTTP server via uvicorn
   pipeline  Run a config-driven YAML batch-fetch pipeline
   fetch     Fetch historical data for a single symbol (CLI)
+  ticker    Stream live NIFTY 50 tick data into tick_data (runs until Ctrl+C)
 
 Usage
 -----
     python run.py server [--host HOST] [--port PORT] [--reload]
-    python run.py pipeline configs/daily_nifty50.yaml [--dry-run] [--workers N]
+    python run.py pipeline configs/daily_nifty50_fetch.yaml [--dry-run] [--workers N]
     python run.py fetch --symbol RELIANCE --from 2025-01-01 --to 2025-03-31 \\
                         [--interval day] [--exchange NSE] [--output FILE.csv]
                         [--oi] [--continuous]
+    python run.py ticker [--mode full|quote|ltp] [--workers N]
 """
 
 from __future__ import annotations
@@ -48,6 +50,45 @@ def _run_pipeline(args: argparse.Namespace) -> None:
     from pipeline import load_config, run_pipeline
     cfg = load_config(args.config)
     run_pipeline(cfg, dry_run=args.dry_run, workers=args.workers)
+
+
+def _run_ticker(args: argparse.Namespace) -> None:
+    import signal
+    import time
+    from database import ensure_tick_tables
+    from ws_ticker import WsTickerManager
+
+    ensure_tick_tables()
+
+    manager = WsTickerManager(mode=args.mode, num_workers=args.workers)
+    manager.start_scheduler()   # auto-start at 09:15 IST, auto-stop at 15:30 IST
+
+    # Also start immediately if called manually outside scheduler
+    status = manager.start()
+    print(f"Ticker {status}. Streaming live NIFTY 50 tick data → tick_data table.")
+    print("Press Ctrl+C to stop.\n")
+
+    stop_event = False
+
+    def _handle_stop(sig, frame):
+        nonlocal stop_event
+        stop_event = True
+
+    signal.signal(signal.SIGINT,  _handle_stop)
+    signal.signal(signal.SIGTERM, _handle_stop)
+
+    try:
+        while not stop_event:
+            time.sleep(5)
+            print(
+                f"  stored={manager.ticks_stored:,}  "
+                f"dropped={manager.ticks_dropped}  "
+                f"connected={manager.is_connected}  "
+                f"queue={manager.queue_depth}"
+            )
+    finally:
+        manager.stop_scheduler()
+        print(f"\nStopped. Total ticks stored: {manager.ticks_stored:,}")
 
 
 def _run_fetch(args: argparse.Namespace) -> None:
@@ -107,6 +148,21 @@ def _build_parser() -> argparse.ArgumentParser:
     pl.add_argument("--workers", "-w", type=int, default=4, metavar="N",
                     help="Parallel worker threads (default: 4)")
 
+    # ── ticker ────────────────────────────────────────────────────────────────
+    tk = sub.add_parser(
+        "ticker",
+        help="Stream live NIFTY 50 tick data into tick_data (runs until Ctrl+C)",
+        description="Connect to Kite WebSocket and store real-time ticks for all watched symbols",
+    )
+    tk.add_argument(
+        "--mode", default="full", choices=["full", "quote", "ltp"],
+        help="Tick subscription mode: full=OHLC+depth+OI, quote=OHLC, ltp=price only (default: full)",
+    )
+    tk.add_argument(
+        "--workers", "-w", type=int, default=2, metavar="N",
+        help="Parallel DB-writer threads (default: 2)",
+    )
+
     # ── fetch ─────────────────────────────────────────────────────────────────
     fe = sub.add_parser(
         "fetch",
@@ -147,3 +203,5 @@ if __name__ == "__main__":
         _run_pipeline(args)
     elif args.command == "fetch":
         _run_fetch(args)
+    elif args.command == "ticker":
+        _run_ticker(args)
