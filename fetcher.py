@@ -9,16 +9,16 @@ Given a trading symbol, exchange, date range, and candle interval this module:
 
 from __future__ import annotations
 
-from datetime import datetime, date, timedelta
+import sys
+import time
+import logging
+from datetime import datetime, date
 from typing import Union
 
 import pandas as pd
 from kiteconnect import KiteConnect
 
-from exceptions import KiteAPIError, SymbolNotFoundError, InvalidIntervalError
-from log_config import get_logger
-
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 # Candle intervals supported by Kite Connect
 VALID_INTERVALS = {
@@ -39,6 +39,33 @@ INTERVAL_MAX_DAYS = {
 }
 
 
+def _fetch_with_retry(fn, symbol: str, max_attempts: int = 3, backoff_seconds: int = 2):
+    """
+    Call fn(), retrying on failure with exponential backoff.
+
+    Wait schedule (base=2):  attempt 1 → 2s, attempt 2 → 4s, attempt 3 → give up.
+    """
+    last_exc = None
+    for attempt in range(max_attempts):
+        try:
+            return fn()
+        except Exception as exc:
+            last_exc = exc
+            if attempt < max_attempts - 1:
+                wait = backoff_seconds * (2 ** attempt)
+                logger.warning(
+                    "Attempt %d/%d failed for %s: %s — retrying in %ds…",
+                    attempt + 1, max_attempts, symbol, exc, wait,
+                )
+                time.sleep(wait)
+            else:
+                logger.error(
+                    "All %d attempts exhausted for %s: %s",
+                    max_attempts, symbol, exc,
+                )
+    raise last_exc
+
+
 def lookup_instrument_token(
     kite: KiteConnect,
     symbol: str,
@@ -47,123 +74,44 @@ def lookup_instrument_token(
     """
     Return the instrument_token for `symbol` on `exchange`.
 
-    Resolution order
-    ----------------
-    1. Check the local ``instrument_master`` DB cache (fast, no API call).
-    2. On cache miss, fetch the full instrument list from Kite and return the
-       matching token (the cache is *not* populated here — use
-       ``refresh_instrument_master()`` for bulk warming).
-
-    Raises
-    ------
-    SymbolNotFoundError  if the symbol does not exist on the exchange.
-    KiteAPIError         if the instruments list cannot be fetched.
+    Parameters
+    ----------
+    kite     : authenticated KiteConnect instance
+    symbol   : trading symbol, e.g. "RELIANCE", "NIFTY 50"
+    exchange : exchange segment, e.g. "NSE", "BSE", "NFO", "MCX"
     """
-    from database import get_instrument_token_from_db
-
-    # ── Fast path: local DB cache ──────────────────────────────────────────
-    cached = get_instrument_token_from_db(symbol, exchange)
-    if cached is not None:
-        return cached
-
-    # ── Slow path: live Kite API call ──────────────────────────────────────
-    logger.debug(
-        "Instrument cache miss for %s:%s — fetching from Kite API",
-        exchange, symbol,
-    )
-    try:
-        instruments = kite.instruments(exchange=exchange)
-    except Exception as exc:
-        raise KiteAPIError(
-            f"Failed to fetch instrument list for exchange '{exchange}': {exc}"
-        ) from exc
-
+    instruments = kite.instruments(exchange=exchange)
     symbol_upper = symbol.upper().strip()
 
-    try:
-        matches = [
-            inst for inst in instruments
-            if inst["tradingsymbol"].upper() == symbol_upper
-        ]
-    except Exception as exc:
-        raise KiteAPIError(
-            f"Error while searching instrument list: {exc}"
-        ) from exc
+    matches = [
+        inst for inst in instruments
+        if inst["tradingsymbol"].upper() == symbol_upper
+    ]
 
     if not matches:
+        # Provide a helpful list of close matches
         close = [
             inst["tradingsymbol"]
             for inst in instruments
             if symbol_upper in inst["tradingsymbol"].upper()
         ][:10]
-        hint = f"\n  Possible matches: {close}" if close else ""
-        raise SymbolNotFoundError(
-            f"Symbol '{symbol}' not found on {exchange}.{hint}\n"
+        hint = f" Possible matches: {close}" if close else ""
+        raise ValueError(
+            f"Symbol '{symbol}' not found on {exchange}.{hint} "
             f"Check the symbol name or try a different exchange (NSE, BSE, NFO, MCX)."
         )
 
     if len(matches) > 1:
         logger.warning(
-            "Multiple instruments match '%s' on %s — using first: %s (token=%s, name='%s')",
+            "Multiple instruments match '%s' on %s. Using first: %s (token=%s, name='%s').",
             symbol, exchange,
             matches[0]["tradingsymbol"],
             matches[0]["instrument_token"],
             matches[0]["name"],
         )
 
-    return int(matches[0]["instrument_token"])
-
-
-def refresh_instrument_master(
-    kite:          KiteConnect,
-    exchanges:     list[str] | None = None,
-    max_age_hours: float = 24.0,
-) -> dict[str, int]:
-    """
-    Fetch the full instrument list for each exchange from Kite and persist it
-    to the ``instrument_master`` DB table.
-
-    Staleness check
-    ---------------
-    If the cached data for an exchange is younger than *max_age_hours* the
-    exchange is skipped.  Pass ``max_age_hours=0`` to force a full refresh.
-
-    Returns
-    -------
-    A dict mapping ``{exchange: rows_upserted}``.  Exchanges that were
-    skipped because their cache was fresh have a value of ``0``.
-    """
-    from database import upsert_instruments, get_instruments_refreshed_at
-
-    exchanges = exchanges or ["NSE", "BSE", "NFO", "MCX"]
-    now       = datetime.utcnow()
-    results: dict[str, int] = {}
-
-    for exchange in exchanges:
-        if max_age_hours > 0:
-            last = get_instruments_refreshed_at(exchange)
-            if last and (now - last) < timedelta(hours=max_age_hours):
-                logger.info(
-                    "Instrument master for %s is fresh (age < %.0fh) — skipping",
-                    exchange, max_age_hours,
-                )
-                results[exchange] = 0
-                continue
-
-        try:
-            instruments = kite.instruments(exchange=exchange)
-            count       = upsert_instruments(exchange, instruments)
-            logger.info(
-                "Instrument master refreshed for %s: %d rows upserted",
-                exchange, count,
-            )
-            results[exchange] = count
-        except Exception as exc:
-            raise KiteAPIError(
-                f"Failed to refresh instrument master for {exchange}: {exc}"
-            ) from exc
-
-    return results
+    token: int = matches[0]["instrument_token"]
+    return token
 
 
 def fetch_historical_data(
@@ -175,82 +123,80 @@ def fetch_historical_data(
     exchange: str = "NSE",
     continuous: bool = False,
     oi: bool = False,
-) -> tuple[pd.DataFrame, int]:
+    max_attempts: int = 3,
+    backoff_seconds: int = 2,
+) -> pd.DataFrame:
     """
-    Fetch OHLCV candle data for a symbol and return a (DataFrame, token) tuple.
+    Fetch OHLCV candle data for a symbol and return a DataFrame.
 
-    Raises
-    ------
-    InvalidIntervalError   if `interval` is not in VALID_INTERVALS.
-    ValueError             if from_date > to_date.
-    SymbolNotFoundError    if the symbol does not exist.
-    KiteAPIError           if the historical_data API call fails.
+    Parameters
+    ----------
+    kite       : authenticated KiteConnect instance
+    symbol     : trading symbol, e.g. "RELIANCE"
+    from_date  : start date  — "YYYY-MM-DD" string, date, or datetime
+    to_date    : end date    — "YYYY-MM-DD" string, date, or datetime
+    interval   : candle interval — one of VALID_INTERVALS
+    exchange   : exchange segment, default "NSE"
+    continuous : True for continuous data (futures/options)
+    oi         : True to include open interest column
+
+    Returns
+    -------
+    pd.DataFrame with columns: date, open, high, low, close, volume[, oi]
     """
     interval = interval.lower().strip()
     if interval not in VALID_INTERVALS:
-        raise InvalidIntervalError(
+        raise ValueError(
             f"Invalid interval '{interval}'. "
             f"Choose from: {sorted(VALID_INTERVALS)}"
         )
 
-    try:
-        from_dt = _to_datetime(from_date, is_start=True)
-        to_dt   = _to_datetime(to_date,   is_start=False)
-    except ValueError:
-        raise
+    # Normalise dates to datetime objects for the SDK
+    from_dt = _to_datetime(from_date, is_start=True)
+    to_dt   = _to_datetime(to_date,   is_start=False)
 
     if from_dt > to_dt:
-        raise ValueError(
-            f"from_date ({from_dt.date()}) must be earlier than to_date ({to_dt.date()})."
-        )
+        raise ValueError("from_date must be earlier than to_date.")
 
     delta_days = (to_dt - from_dt).days
-    max_days   = INTERVAL_MAX_DAYS[interval]
+    max_days = INTERVAL_MAX_DAYS[interval]
     if delta_days > max_days:
         logger.warning(
-            "Requested range (%d days) exceeds Kite limit of %d days for '%s' candles — "
-            "API may return partial data or raise an error.",
+            "Requested range (%d days) exceeds Kite limit of %d days for '%s' candles.",
             delta_days, max_days, interval,
         )
 
-    # Raises SymbolNotFoundError / KiteAPIError if lookup fails
     instrument_token = lookup_instrument_token(kite, symbol, exchange)
 
     logger.info(
-        "Fetching %s candles for %s (%s) from %s to %s [token=%s]",
+        "Fetching %s candles for %s (%s) from %s to %s [token=%s].",
         interval, symbol, exchange, from_dt.date(), to_dt.date(), instrument_token,
     )
 
-    try:
-        records = kite.historical_data(
+    records = _fetch_with_retry(
+        lambda: kite.historical_data(
             instrument_token=instrument_token,
             from_date=from_dt,
             to_date=to_dt,
             interval=interval,
             continuous=continuous,
             oi=oi,
-        )
-    except Exception as exc:
-        raise KiteAPIError(
-            f"historical_data() failed for {symbol} ({exchange}) "
-            f"[{from_dt.date()} → {to_dt.date()}]: {exc}"
-        ) from exc
+        ),
+        symbol=symbol,
+        max_attempts=max_attempts,
+        backoff_seconds=backoff_seconds,
+    )
 
     if not records:
-        logger.warning("No data returned for %s (%s) [%s → %s].", symbol, exchange, from_dt.date(), to_dt.date())
+        logger.warning("No data returned for %s (%s) %s — %s.", symbol, exchange, from_dt.date(), to_dt.date())
         return pd.DataFrame(), instrument_token
 
-    try:
-        df = pd.DataFrame(records)
-        df["date"] = pd.to_datetime(df["date"])
-        df.set_index("date", inplace=True)
-        df.sort_index(inplace=True)
-    except Exception as exc:
-        raise KiteAPIError(
-            f"Failed to parse historical data response for {symbol}: {exc}"
-        ) from exc
+    df = pd.DataFrame(records)
+    df["date"] = pd.to_datetime(df["date"])
+    df.set_index("date", inplace=True)
+    df.sort_index(inplace=True)
 
-    logger.info("Retrieved %d candles for %s (%s).", len(df), symbol, exchange)
+    logger.info("Retrieved %d candles for %s.", len(df), symbol)
     return df, instrument_token
 
 
@@ -270,15 +216,11 @@ def _to_datetime(value: Union[str, date, datetime], is_start: bool) -> datetime:
             try:
                 dt = datetime.strptime(value, fmt)
                 if fmt == "%Y-%m-%d":
-                    dt = dt.replace(
-                        hour=0 if is_start else 23,
-                        minute=0 if is_start else 59,
-                        second=0 if is_start else 59,
-                    )
+                    dt = dt.replace(hour=0 if is_start else 23,
+                                    minute=0 if is_start else 59,
+                                    second=0 if is_start else 59)
                 return dt
             except ValueError:
                 continue
-        raise ValueError(
-            f"Cannot parse date '{value}'. Use 'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM:SS'."
-        )
-    raise TypeError(f"Unsupported date type: {type(value)}")
+        raise ValueError(f"Cannot parse date '{value}'. Use 'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM:SS'.")
+    raise ValueError(f"Unsupported date type: {type(value)}")

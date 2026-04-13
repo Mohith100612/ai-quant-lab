@@ -3,19 +3,19 @@ Zerodha Kite Connect — FastAPI server.
 
 Endpoints
 ---------
-GET  /auth/login-url               → Kite login URL to open in browser
-POST /auth/session                 → Exchange request_token for access_token
+GET  /auth/login-url        → Kite login URL to open in browser
+POST /auth/session          → Exchange request_token for access_token
 
-GET  /candles                      → Check DB first; if missing fetch from Kite, save, return
+GET  /candles               → Check DB first; if missing fetch from Kite, save, return
 
-POST /ws-ticker/watch              → Add a symbol to the WebSocket watch list
-DEL  /ws-ticker/watch/{symbol}     → Remove a symbol from the watch list
-GET  /ws-ticker/watch              → List all watched symbols
-POST /ws-ticker/start              → Manually start WebSocket streaming
-POST /ws-ticker/stop               → Manually stop WebSocket streaming
-GET  /ws-ticker/status             → Streaming state, subscribed symbols, scheduler info
+POST /ticker/watch          → Add a symbol to the real-time watch list
+DEL  /ticker/watch/{symbol} → Remove a symbol from the watch list
+GET  /ticker/watch          → List all watched symbols
+POST /ticker/start          → Manually start real-time polling
+POST /ticker/stop           → Manually stop real-time polling
+GET  /ticker/status         → Is the ticker running?
 
-GET  /ticks                        → Query stored real-time tick snapshots
+GET  /ticks                 → Query stored 1-second tick snapshots
 
 Run
 ---
@@ -24,79 +24,52 @@ Run
 
 from __future__ import annotations
 
-import os
-import threading
+import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
-from typing import Literal, Optional
+from typing import Literal
 
 import pandas as pd
-from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 
 from auth import get_login_url, generate_session, get_authenticated_kite
-from fetcher import fetch_historical_data, _to_datetime, refresh_instrument_master
+from fetcher import fetch_historical_data, _to_datetime
 from database import (
-    ensure_table, data_exists, save_to_db, _get_connection,
-    ensure_tick_tables, ensure_extended_tables,
-    get_watched_symbols, add_watched_symbol,
-    query_tick_data,
+    ensure_table, data_exists, save_to_db, get_db_connection,
+    ensure_tick_tables,
+    get_watched_symbols, add_watched_symbol, remove_watched_symbol,
+    get_enriched_candles,
 )
-from ws_ticker import ws_ticker_manager
-from log_config import configure_logging, get_logger
+from ticker import ticker_manager
 
-configure_logging()
-logger = get_logger(__name__)
-
-_ENV_FILE = os.path.join(os.path.dirname(__file__), ".env")
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # FastAPI lifespan — runs on startup and shutdown
 # ---------------------------------------------------------------------------
-
-def _background_instrument_refresh() -> None:
-    """
-    Refresh instrument_master for NSE + BSE on startup (skipped if fresh < 24 h).
-    Runs in a daemon thread so it never blocks the server from accepting requests.
-    """
-    try:
-        kite    = get_authenticated_kite()
-        results = refresh_instrument_master(kite, ["NSE", "BSE", "NFO", "MCX"], max_age_hours=24)
-        logger.info("Startup instrument refresh complete: %s", results)
-    except Exception as exc:
-        logger.warning("Startup instrument refresh failed (non-fatal): %s", exc)
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # ── Startup ──────────────────────────────────────────────────────────────
     try:
         ensure_tick_tables()
-        ensure_extended_tables()
-        logger.info("Database tables ready.")
+        logger.info("Tick tables ready.")
     except Exception as exc:
-        logger.error("Could not create database tables: %s", exc)
+        logger.error("Could not create tick tables: %s", exc)
 
-    # Refresh instrument master in the background — doesn't block startup
-    threading.Thread(
-        target=_background_instrument_refresh,
-        name="startup-instrument-refresh",
-        daemon=True,
-    ).start()
-
-    ws_ticker_manager.start_scheduler()    # 08:30 refresh / 09:15 open / 15:30 close IST (Mon–Fri)
+    ticker_manager.start_scheduler()   # registers 09:15 / 15:30 cron jobs
 
     yield   # ← application runs here
 
     # ── Shutdown ─────────────────────────────────────────────────────────────
-    ws_ticker_manager.stop_scheduler()
+    ticker_manager.stop_scheduler()
 
 
 app = FastAPI(
     title="Zerodha Kite Connect API",
-    description="REST wrapper around Kite Connect with WebSocket real-time tick streaming",
+    description="REST wrapper around Kite Connect with real-time tick collection",
     version="2.0.0",
     lifespan=lifespan,
 )
@@ -104,88 +77,6 @@ app = FastAPI(
 @app.get("/", include_in_schema=False)
 def root():
     return RedirectResponse(url="/docs")
-
-
-# ---------------------------------------------------------------------------
-# System — health & liveness
-# ---------------------------------------------------------------------------
-
-_QUEUE_BACKLOG_THRESHOLD = 500   # tick batches; breach → degraded
-
-
-@app.get("/ping", tags=["System"])
-def ping():
-    """Liveness probe — always returns 200 OK as long as the process is alive."""
-    return {"status": "ok"}
-
-
-@app.get("/health", tags=["System"])
-def health():
-    """
-    Readiness / health check.
-
-    Checks
-    ------
-    database   — runs ``SELECT 1`` against the connection pool.
-    kite_auth  — verifies ``KITE_ACCESS_TOKEN`` is present in ``.env``
-                 (does **not** make a live API call to avoid latency).
-    tick_queue — reports the WebSocket tick-store queue depth and flags it
-                 as degraded when the backlog exceeds the threshold
-                 (``{threshold}`` batches).
-
-    HTTP status
-    -----------
-    200  all critical checks pass (database ok, queue within threshold).
-    503  database unreachable **or** queue backlog exceeds threshold.
-    """
-    checks: dict = {}
-    healthy = True
-
-    # ── 1. Database ──────────────────────────────────────────────────────────
-    try:
-        conn = _get_connection()
-        cur  = conn.cursor()
-        cur.execute("SELECT 1")
-        cur.close()
-        conn.close()
-        checks["database"] = {"status": "ok"}
-    except Exception as exc:
-        checks["database"] = {"status": "error", "detail": str(exc)}
-        healthy = False
-
-    # ── 2. Kite auth token presence ──────────────────────────────────────────
-    load_dotenv(dotenv_path=_ENV_FILE)
-    access_token = os.getenv("KITE_ACCESS_TOKEN", "")
-    if access_token:
-        checks["kite_auth"] = {"status": "ok", "token_present": True}
-    else:
-        checks["kite_auth"] = {
-            "status":  "degraded",
-            "detail":  "KITE_ACCESS_TOKEN not set — fetch and ws-ticker endpoints unavailable",
-        }
-        # Auth absence is a warning, not a fatal failure for the health check itself
-
-    # ── 3. WebSocket tick-queue backlog ──────────────────────────────────────
-    depth = ws_ticker_manager.queue_depth
-    if depth > _QUEUE_BACKLOG_THRESHOLD:
-        checks["tick_queue"] = {
-            "status":    "degraded",
-            "depth":     depth,
-            "threshold": _QUEUE_BACKLOG_THRESHOLD,
-            "detail":    "Queue backlog exceeds threshold — consumer may be lagging",
-        }
-        healthy = False
-    else:
-        checks["tick_queue"] = {"status": "ok", "depth": depth}
-
-    return JSONResponse(
-        status_code=200 if healthy else 503,
-        content={
-            "healthy": healthy,
-            "checks":  checks,
-            "ts":      datetime.utcnow().isoformat(timespec="milliseconds"),
-        },
-    )
 
 
 IntervalLiteral = Literal[
@@ -226,7 +117,7 @@ def create_session(body: SessionRequest):
 
 
 # ---------------------------------------------------------------------------
-# Candles
+# Candles — single endpoint (DB-first, then Kite API with auto-chunking)
 # ---------------------------------------------------------------------------
 
 @app.get("/candles", tags=["Candles"])
@@ -247,7 +138,7 @@ def get_candles(
     try:
         from_dt = _to_datetime(from_date, is_start=True)
         to_dt   = _to_datetime(to_date,   is_start=False)
-    except Exception as exc:
+    except (Exception, SystemExit) as exc:
         raise HTTPException(status_code=422, detail=str(exc))
 
     if from_dt > to_dt:
@@ -294,6 +185,11 @@ def get_candles(
                 instrument_token = token
             cur_start = cur_end + timedelta(days=1)
     except Exception as exc:
+        if "api_key" in str(exc) or "access_token" in str(exc):
+            raise HTTPException(
+                status_code=404, 
+                detail="No historical data available for this date range (Kite Connect subscription limits reached)."
+            )
         raise HTTPException(status_code=400, detail=f"Kite API error: {exc}")
 
     if not all_frames:
@@ -321,20 +217,75 @@ def get_candles(
 
 
 # ---------------------------------------------------------------------------
-# WebSocket Ticker — watch list
+# Enriched candles — DB-computed derived columns
 # ---------------------------------------------------------------------------
 
-@app.delete("/ws-ticker/watch/{symbol}", tags=["WebSocket Ticker"])
+@app.get("/candles/enriched", tags=["Candles"])
+def get_candles_enriched(
+    symbol:    str = Query(...,   description="Trading symbol e.g. RELIANCE"),
+    from_date: str = Query(...,   alias="from", description="Start date YYYY-MM-DD"),
+    to_date:   str = Query(...,   alias="to",   description="End date YYYY-MM-DD"),
+):
+    """
+    Return OHLCV candles with DB-computed columns from the ohlcv_enriched view:
+    candle_range, body_size, is_bullish, daily_return_pct.
+
+    Data must already be loaded via GET /candles first.
+    """
+    try:
+        from_dt = _to_datetime(from_date, is_start=True)
+        to_dt   = _to_datetime(to_date,   is_start=False)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    if from_dt > to_dt:
+        raise HTTPException(status_code=422, detail="from_date must be earlier than to_date")
+
+    try:
+        candles = get_enriched_candles(symbol, from_dt, to_dt)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Database error: {exc}")
+
+    return {
+        "symbol": symbol.upper(),
+        "from":   from_dt.date().isoformat(),
+        "to":     to_dt.date().isoformat(),
+        "total":  len(candles),
+        "candles": candles,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Ticker — watch list management
+# ---------------------------------------------------------------------------
+
+class WatchRequest(BaseModel):
+    symbol:   str
+    exchange: str = "NSE"
+
+
+@app.post("/ticker/watch", tags=["Ticker"])
+def add_symbol_to_watch(body: WatchRequest):
+    """Add a symbol to the real-time watch list (starts collecting at next 09:15 IST)."""
+    try:
+        inserted = add_watched_symbol(body.symbol, body.exchange)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Database error: {exc}")
+    return {
+        "symbol":   body.symbol.upper(),
+        "exchange": body.exchange.upper(),
+        "status":   "added" if inserted else "already_watching",
+    }
+
+
+@app.delete("/ticker/watch/{symbol}", tags=["Ticker"])
 def remove_symbol_from_watch(
     symbol:   str,
     exchange: str = Query("NSE", description="Exchange: NSE, BSE, NFO, MCX"),
 ):
-    """
-    Remove a symbol from the watch list.
-    If streaming is active the token is unsubscribed immediately — no reconnect needed.
-    """
+    """Remove a symbol from the real-time watch list."""
     try:
-        deleted = ws_ticker_manager.remove_symbol(symbol, exchange)
+        deleted = remove_watched_symbol(symbol, exchange)
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"Database error: {exc}")
     if not deleted:
@@ -345,89 +296,54 @@ def remove_symbol_from_watch(
     return {"symbol": symbol.upper(), "exchange": exchange.upper(), "status": "removed"}
 
 
-# ---------------------------------------------------------------------------
-# WebSocket Ticker — control & status
-# ---------------------------------------------------------------------------
-
-class StartRequest(BaseModel):
-    symbols:  list[str]      = []
-    exchange: str             = "NSE"
-    modes:    dict[str, str] = {}
-
-
-@app.post("/ws-ticker/start", tags=["WebSocket Ticker"])
-def start_ws_ticker(body: Optional[StartRequest] = None):
-    """
-    Start KiteTicker WebSocket streaming.
-
-    Pass ``symbols`` to add them to the watch list **and** start in one call:
-
-        POST /ws-ticker/start
-        {"symbols": ["RELIANCE", "INFY", "TCS"], "exchange": "NSE"}
-
-    Omit ``symbols`` (or send ``{}``) to start with whatever is already in
-    the watch list.
-    """
-    if body and body.symbols:
-        try:
-            for sym in body.symbols:
-                add_watched_symbol(sym, body.exchange)
-        except Exception as exc:
-            raise HTTPException(status_code=503, detail=f"Database error: {exc}")
-
-    if body and body.modes:
-        try:
-            ws_ticker_manager.set_symbol_modes(body.modes)
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc))
-
+@app.get("/ticker/watch", tags=["Ticker"])
+def list_watched_symbols():
+    """List all symbols currently in the real-time watch list."""
     try:
-        status = ws_ticker_manager.start()
+        symbols = get_watched_symbols()
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Database error: {exc}")
+    return {"watched": symbols, "count": len(symbols)}
+
+
+# ---------------------------------------------------------------------------
+# Ticker — manual start / stop / status
+# ---------------------------------------------------------------------------
+
+@app.post("/ticker/start", tags=["Ticker"])
+def start_ticker():
+    """Manually start real-time polling (without waiting for 09:15 IST)."""
+    try:
+        status = ticker_manager.start_polling()
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
+    return {"status": status}
 
-    watched = []
+
+@app.post("/ticker/stop", tags=["Ticker"])
+def stop_ticker():
+    """Manually stop real-time polling."""
+    return {"status": ticker_manager.stop_polling()}
+
+
+@app.get("/ticker/status", tags=["Ticker"])
+def ticker_status():
+    """Return whether the ticker is running and how many symbols are watched."""
     try:
-        watched = [s["symbol"] for s in get_watched_symbols()]
+        count = len(get_watched_symbols())
     except Exception:
-        pass
-
-    return {"status": status, "watching": watched}
-
-
-@app.post("/ws-ticker/stop", tags=["WebSocket Ticker"])
-def stop_ws_ticker():
-    """Manually stop KiteTicker WebSocket streaming and drain the store queue."""
-    return {"status": ws_ticker_manager.stop()}
-
-
-@app.get("/ws-ticker/status", tags=["WebSocket Ticker"])
-def ws_ticker_status():
-    """Return streaming state, full watch list, queue depth, and scheduler info."""
-    try:
-        watched = get_watched_symbols()
-    except Exception:
-        watched = []
+        count = 0
     return {
-        "streaming_active":   ws_ticker_manager.is_running,
-        "ws_connected":       ws_ticker_manager.is_connected,
-        "scheduler_active":   ws_ticker_manager.scheduler_running,
-        "watched":            [s["symbol"] for s in watched],
-        "watched_count":      len(watched),
-        "subscribed_symbols": ws_ticker_manager.subscribed_symbols,
-        "queue_depth":        ws_ticker_manager.queue_depth,
-        "queue_capacity":     ws_ticker_manager.queue_capacity,
-        "ticks_stored":       ws_ticker_manager.ticks_stored,
-        "ticks_dropped":      ws_ticker_manager.ticks_dropped,
-        "num_workers":        ws_ticker_manager._num_workers,
-        "last_tick_at":       ws_ticker_manager.last_tick_at,
-        "auto_start":         "09:15 IST (Mon–Fri)",
-        "auto_stop":          "15:30 IST (Mon–Fri)",
+        "polling_active":   ticker_manager.is_running,
+        "scheduler_active": ticker_manager.scheduler_running,
+        "watched_count":    count,
+        "auto_start":       "09:15 IST (Mon–Fri)",
+        "auto_stop":        "15:30 IST (Mon–Fri)",
     }
 
 
 # ---------------------------------------------------------------------------
-# Ticks — query stored real-time snapshots
+# Ticks — query stored 1-second snapshots
 # ---------------------------------------------------------------------------
 
 @app.get("/ticks", tags=["Ticks"])
@@ -437,45 +353,47 @@ def get_ticks(
     to_dt:   str = Query(...,   alias="to",   description="End:   YYYY-MM-DD or YYYY-MM-DD HH:MM:SS"),
     limit:   int = Query(3600,  description="Max rows (default 3600 = 1 hour, max 86400)", ge=1, le=86400),
 ):
-    """Query real-time tick snapshots from tick_data for a symbol within a time range."""
+    """Query real-time 1-second tick snapshots from stock_data for a symbol within a time range."""
     try:
         from_parsed = _to_datetime(from_dt, is_start=True)
         to_parsed   = _to_datetime(to_dt,   is_start=False)
-    except Exception as exc:
+    except (Exception, SystemExit) as exc:
         raise HTTPException(status_code=422, detail=str(exc))
 
     if from_parsed > to_parsed:
         raise HTTPException(status_code=422, detail="from must be earlier than to")
 
     try:
-        rows = query_tick_data(symbol, from_parsed, to_parsed, limit)
+        with get_db_connection() as conn:
+            if not conn:
+                raise HTTPException(status_code=503, detail="Database connection failed")
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT instrument_token, symbol, timestamp,
+                       open, high, low, close, volume
+                  FROM stock_data
+                 WHERE symbol    = %s
+                   AND timestamp BETWEEN %s AND %s
+                 ORDER BY timestamp ASC
+                 LIMIT %s
+                """,
+                (symbol.upper(), from_parsed, to_parsed, limit),
+            )
+            rows = cursor.fetchall()
+            cursor.close()
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"Database query failed: {exc}")
 
-    def _iso(val):
-        return val.isoformat() if hasattr(val, "isoformat") else (str(val) if val else None)
-
     ticks = [
         {
-            "timestamp":             _iso(row["captured_at"]),
-            "instrument_token":      int(row["instrument_token"]),
-            "last_price":            float(row["last_price"]),
-            "open":                  float(row["open"])        if row["open"]         is not None else None,
-            "high":                  float(row["high"])        if row["high"]         is not None else None,
-            "low":                   float(row["low"])         if row["low"]          is not None else None,
-            "close":                 float(row["close"])       if row["close"]        is not None else None,
-            "volume":                int(row["volume"])        if row["volume"]       is not None else 0,
-            "buy_quantity":          int(row["buy_quantity"])  if row["buy_quantity"] is not None else 0,
-            "sell_quantity":         int(row["sell_quantity"]) if row["sell_quantity"] is not None else 0,
-            "change_pct":            float(row["change_pct"]) if row["change_pct"]   is not None else None,
-            "last_traded_quantity":  int(row["last_traded_quantity"])  if row.get("last_traded_quantity")  is not None else 0,
-            "avg_traded_price":      float(row["avg_traded_price"])    if row.get("avg_traded_price")      is not None else None,
-            "oi":                    int(row["oi"])                    if row.get("oi")                    is not None else 0,
-            "oi_day_high":           int(row["oi_day_high"])           if row.get("oi_day_high")           is not None else 0,
-            "oi_day_low":            int(row["oi_day_low"])            if row.get("oi_day_low")            is not None else 0,
-            "last_trade_time":       _iso(row.get("last_trade_time")),
-            "exchange_timestamp":    _iso(row.get("exchange_timestamp")),
-            "depth":                 row.get("depth"),
+            "timestamp":        row["timestamp"].isoformat() if hasattr(row["timestamp"], "isoformat") else str(row["timestamp"]),
+            "open":             float(row["open"])   if row["open"]   is not None else None,
+            "high":             float(row["high"])   if row["high"]   is not None else None,
+            "low":              float(row["low"])    if row["low"]    is not None else None,
+            "close":            float(row["close"])  if row["close"]  is not None else None,
+            "volume":           int(row["volume"])   if row["volume"] is not None else 0,
+            "instrument_token": int(row["instrument_token"]),
         }
         for row in rows
     ]
@@ -495,21 +413,22 @@ def get_ticks(
 
 def _fetch_candles_from_db(symbol: str, from_dt: datetime, to_dt: datetime) -> list[dict]:
     try:
-        conn   = _get_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            SELECT timestamp, open, high, low, close, volume
-              FROM stock_data
-             WHERE symbol    = %s
-               AND timestamp BETWEEN %s AND %s
-             ORDER BY timestamp
-            """,
-            (symbol.upper(), from_dt, to_dt),
-        )
-        rows = cursor.fetchall()
-        cursor.close()
-        conn.close()
+        with get_db_connection() as conn:
+            if not conn:
+                raise HTTPException(status_code=503, detail="Database connection failed")
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT timestamp, open, high, low, close, volume
+                  FROM stock_data
+                 WHERE symbol    = %s
+                   AND timestamp BETWEEN %s AND %s
+                 ORDER BY timestamp
+                """,
+                (symbol.upper(), from_dt, to_dt),
+            )
+            rows = cursor.fetchall()
+            cursor.close()
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"Database query failed: {exc}")
 

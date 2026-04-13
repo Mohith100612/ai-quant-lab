@@ -16,6 +16,7 @@ python main.py --symbol "NIFTY 50" --from 2025-03-24 --to 2025-03-31 \
 """
 
 import argparse
+import logging
 import os
 import sys
 
@@ -23,11 +24,9 @@ import pandas as pd
 
 from auth import get_authenticated_kite
 from fetcher import fetch_historical_data, VALID_INTERVALS, _to_datetime
-from database import ensure_table, ensure_extended_tables, data_exists, save_to_db
-from log_config import configure_logging, get_logger, new_correlation_id, set_correlation_id
+from database import ensure_table, data_exists, save_to_db
 
-configure_logging()
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -85,10 +84,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main():
-    set_correlation_id(new_correlation_id())
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)-8s %(name)s  %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
 
     parser = build_parser()
-    args   = parser.parse_args()
+    args = parser.parse_args()
 
     symbol   = args.symbol
     exchange = args.exchange.upper()
@@ -96,20 +99,15 @@ def main():
 
     from_dt = _to_datetime(args.from_date, is_start=True)
     to_dt   = _to_datetime(args.to_date,   is_start=False)
-    logger.debug("Date range parsed", extra={"from": str(from_dt), "to": str(to_dt)})
+    logger.info("Date range: %s to %s", from_dt.date(), to_dt.date())
 
-    logger.info("Initialising database tables")
     ensure_table()
-    ensure_extended_tables()
 
     if data_exists(symbol, exchange, interval, from_dt, to_dt):
-        logger.info("Data already present in DB for %s — nothing to fetch", symbol)
+        logger.info("Data already in database — skipping fetch.")
         sys.exit(0)
 
-    logger.info(
-        "Fetching %s (%s) %s candles from %s to %s",
-        symbol, exchange, interval, from_dt.date(), to_dt.date(),
-    )
+    logger.info("Data not in DB — fetching from Kite API.")
     kite = get_authenticated_kite()
     df, instrument_token = fetch_historical_data(
         kite=kite,
@@ -121,20 +119,18 @@ def main():
         continuous=args.continuous,
         oi=args.oi,
     )
-    if not df.empty:
-        rows_saved = save_to_db(df, symbol, instrument_token, exchange, interval, from_dt, to_dt)
-        logger.info("Saved %d candle(s) to stock_data", rows_saved, extra={"rows_saved": rows_saved})
 
     if df.empty:
-        logger.warning("No data returned for %s", symbol)
+        logger.warning("No data returned. Nothing saved.")
         sys.exit(0)
 
-    # Display a preview
+    rows_saved = save_to_db(df, symbol, instrument_token, exchange, interval, from_dt, to_dt)
+    logger.info("Saved %d candle(s) to stock_data.", rows_saved)
+
     pd.set_option("display.max_rows", 20)
     pd.set_option("display.float_format", "{:.2f}".format)
     print("\n" + df.to_string())
 
-    # Optionally save to CSV
     if args.output:
         out_path = os.path.join(os.path.dirname(__file__), args.output)
         df.to_csv(out_path)
