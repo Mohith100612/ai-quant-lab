@@ -5,55 +5,53 @@ Uses KiteTicker (WebSocket) for true real-time streaming tick data instead
 of REST polling.  Ticks arrive as they happen at the exchange level with
 sub-second precision and full market depth (bid/ask, last traded price, OI).
 
-Thread design (producer-consumer)
-----------------------------------
-  KiteTicker internal thread         queue.Queue        ws-store thread
-  (WebSocket callbacks)              (buffer)           (consumer)
-  on_ticks() → _tick_queue.put()  ──────────────────→  _flush() → MySQL
+Optimised producer-consumer design
+------------------------------------
+                                       bounded
+  KiteTicker thread                  queue.Queue            N ws-store-* threads
+  (WebSocket callbacks)              (max 10 000)           (configurable, default 2)
+  on_ticks()                         ┌─────────┐            _store_loop()
+    └─ put_nowait() ────────────────►│  batch  │──────────► _flush() → executemany → MySQL
+       (drops + counts if full)      │  batch  │
+                                     │   ...   │
+                                     └─────────┘
 
-The on_ticks() callback is called by KiteTicker's own internal thread.
-It puts the raw batch into the Queue immediately and returns — the WebSocket
-thread is never blocked by a slow DB write.
+Why multiple consumers?
+  A single consumer means slow DB writes back-pressure the queue.
+  Two consumers interleave their writes — each independently accumulates
+  a mini-batch, inserts it, then goes back to draining.
 
-The ws-store thread drains the Queue, accumulates multiple batches into one
-bulk write, then inserts into the tick_data table.
+Batch-size cap (BATCH_MAX = 500)
+  Prevents a single giant transaction from locking the tick_data table.
+
+Flush timeout (FLUSH_TIMEOUT = 0.5 s)
+  In quiet periods (pre-market, low-traffic symbols) ticks arrive slowly.
+  Without a timeout the last partial batch would sit in memory until the
+  next tick arrives.  The timeout flushes it after half a second.
+
+Back-pressure drop
+  If the DB is so slow that the queue fills to QUEUE_MAX_SIZE, new tick
+  batches are dropped (not the WebSocket thread blocked).  The count is
+  tracked in ticks_dropped for monitoring.
+
+Flush retry
+  Transient MySQL errors (connection reset, brief lock) trigger up to
+  FLUSH_RETRY_MAX retries with exponential backoff before the batch is
+  logged as lost.
 
 Scheduler
 ---------
-WsTickerManager registers two APScheduler cron jobs:
-    09:15 IST Mon–Fri  → start()   (WebSocket connect + subscription)
-    15:30 IST Mon–Fri  → stop()    (disconnect + drain queue)
-
-Call start_scheduler() at application startup and stop_scheduler() at shutdown.
-
-Usage
------
-    from ws_ticker import ws_ticker_manager
-    ws_ticker_manager.start_scheduler()   # called at FastAPI startup
-    ws_ticker_manager.stop_scheduler()    # called at FastAPI shutdown
-    ws_ticker_manager.start()             # manual start (skips scheduler)
-    ws_ticker_manager.stop()              # manual stop
-
-Subscription modes
-------------------
-    TICK_MODE_LTP   = "ltp"    — last traded price only
-    TICK_MODE_QUOTE = "quote"  — LTP + OHLC + volume (no depth)
-    TICK_MODE_FULL  = "full"   — LTP + OHLC + volume + market depth + OI
-
-    Default: TICK_MODE_FULL.  Pass mode= to WsTickerManager() to change.
-
-Instrument tokens
------------------
-KiteTicker subscribes by integer instrument_token, not by symbol string.
-On every connect / reconnect, _on_connect() resolves the watch list symbols
-to their tokens via kite.instruments() and subscribes automatically.
+WsTickerManager registers three APScheduler cron jobs:
+    08:30 IST Mon–Fri  → _on_instrument_refresh()  (warm DB cache)
+    09:15 IST Mon–Fri  → start()                   (WebSocket connect)
+    15:30 IST Mon–Fri  → stop()                    (disconnect + drain)
 """
 
 from __future__ import annotations
 
-import logging
 import queue
 import threading
+import time
 from datetime import datetime
 from typing import Optional
 
@@ -63,62 +61,108 @@ from apscheduler.triggers.cron import CronTrigger
 from kiteconnect import KiteTicker
 
 from auth import get_authenticated_kite
-from database import get_watched_symbols, save_ticks
+from database import (
+    get_watched_symbols, save_ticks, save_order_update,
+    remove_watched_symbol,
+    get_instruments_for_exchange, upsert_instruments,
+)
+from log_config import get_logger, get_correlation_id, set_correlation_id
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 IST = pytz.timezone("Asia/Kolkata")
 
-_STOP_SENTINEL = None   # sentinel value that tells the store thread to exit
+_STOP_SENTINEL = None   # sentinel that tells each store thread to exit
 
 MARKET_OPEN_HOUR,  MARKET_OPEN_MIN  = 9,  15   # 09:15 IST
 MARKET_CLOSE_HOUR, MARKET_CLOSE_MIN = 15, 30   # 15:30 IST
 
-# Subscription modes — passed directly to KiteTicker.set_mode()
+# ── Subscription modes ───────────────────────────────────────────────────────
 TICK_MODE_LTP   = "ltp"    # last traded price only
 TICK_MODE_QUOTE = "quote"  # LTP + OHLC + volume (no market depth)
 TICK_MODE_FULL  = "full"   # LTP + OHLC + volume + market depth + OI
 
 _VALID_MODES = {TICK_MODE_LTP, TICK_MODE_QUOTE, TICK_MODE_FULL}
 
+# ── Tuning knobs (override via subclass or constructor kwargs) ────────────────
+QUEUE_MAX_SIZE  = 10_000   # hard cap — put_nowait drops when full
+BATCH_MAX       = 500      # max ticks per flush  — caps transaction size
+FLUSH_TIMEOUT   = 0.5      # seconds — flush partial batch even at low traffic
+FLUSH_RETRY_MAX = 3        # flush retry attempts before logging ticks as lost
+
 
 class WsTickerManager:
     """
     WebSocket-based real-time tick streamer using KiteTicker.
 
-    start()            → authenticate, connect WebSocket, start store thread
-    stop()             → close WebSocket, drain store thread
-    start_scheduler()  → register 09:15 / 15:30 IST cron jobs (Mon–Fri)
+    start()            → authenticate, connect WebSocket, start N store threads
+    stop()             → close WebSocket, send N sentinels, drain all threads
+    start_scheduler()  → register 08:30 / 09:15 / 15:30 IST cron jobs (Mon–Fri)
     stop_scheduler()   → unregister jobs and shut down APScheduler
+
+    Parameters
+    ----------
+    mode        Tick subscription mode (default: TICK_MODE_FULL)
+    num_workers Number of parallel DB-writer threads (default: 2)
     """
 
-    def __init__(self, mode: str = TICK_MODE_FULL) -> None:
+    def __init__(
+        self,
+        mode:                str  = TICK_MODE_FULL,
+        num_workers:         int  = 2,
+        reconnect_max_tries: int  = 50,
+        reconnect_max_delay: int  = 60,
+        connect_timeout:     int  = 30,
+        debug:               bool = False,
+    ) -> None:
         if mode not in _VALID_MODES:
-            raise ValueError(
-                f"Invalid mode '{mode}'. Choose from: {sorted(_VALID_MODES)}"
-            )
-        self._mode            = mode
-        self._tick_queue: queue.Queue           = queue.Queue()
-        self._kws:        Optional[KiteTicker]  = None
-        self._store_thread: Optional[threading.Thread] = None
+            raise ValueError(f"Invalid mode '{mode}'. Choose from: {sorted(_VALID_MODES)}")
+
+        self._mode                = mode
+        self._num_workers         = max(1, num_workers)
+        self._reconnect_max_tries = reconnect_max_tries
+        self._reconnect_max_delay = reconnect_max_delay
+        self._connect_timeout     = connect_timeout
+        self._debug               = debug
+
+        # Bounded queue — producer never blocks; drops on overflow
+        self._tick_queue: queue.Queue = queue.Queue(maxsize=QUEUE_MAX_SIZE)
+
+        self._kws: Optional[KiteTicker]      = None
+        self._store_threads: list[threading.Thread] = []
         self._running         = threading.Event()
         self._last_tick_at:   Optional[datetime] = None
+
         # instrument_token → {"symbol": str, "exchange": str}
         self._token_meta: dict[int, dict] = {}
+
+        # Per-symbol mode overrides: symbol.upper() → mode string
+        # Symbols not listed here use self._mode as the default.
+        self._symbol_modes: dict[str, str] = {}
+
+        # Observability counters (thread-safe via GIL for int += 1)
+        self._ticks_dropped = 0
+        self._ticks_stored  = 0
+
         self._scheduler = BackgroundScheduler(timezone=IST)
 
-    # ------------------------------------------------------------------
+    # -------------------------------------------------------------------------
     # Scheduler — market-hours auto-start / auto-stop
-    # ------------------------------------------------------------------
+    # -------------------------------------------------------------------------
 
     def start_scheduler(self) -> None:
-        """Register market-open / market-close cron jobs and start APScheduler."""
+        """Register instrument-refresh / market-open / market-close cron jobs."""
+        self._scheduler.add_job(
+            self._on_instrument_refresh,
+            CronTrigger(day_of_week="mon-fri", hour=8, minute=30, timezone=IST),
+            id="instrument_refresh",
+            replace_existing=True,
+        )
         self._scheduler.add_job(
             self._on_market_open,
             CronTrigger(
                 day_of_week="mon-fri",
-                hour=MARKET_OPEN_HOUR,
-                minute=MARKET_OPEN_MIN,
+                hour=MARKET_OPEN_HOUR, minute=MARKET_OPEN_MIN,
                 timezone=IST,
             ),
             id="ws_market_open",
@@ -128,8 +172,7 @@ class WsTickerManager:
             self._on_market_close,
             CronTrigger(
                 day_of_week="mon-fri",
-                hour=MARKET_CLOSE_HOUR,
-                minute=MARKET_CLOSE_MIN,
+                hour=MARKET_CLOSE_HOUR, minute=MARKET_CLOSE_MIN,
                 timezone=IST,
             ),
             id="ws_market_close",
@@ -137,8 +180,8 @@ class WsTickerManager:
         )
         self._scheduler.start()
         logger.info(
-            "WS scheduler started — market open %02d:%02d IST, "
-            "close %02d:%02d IST (Mon–Fri).",
+            "WS scheduler started — instrument refresh 08:30 IST, "
+            "market open %02d:%02d IST, close %02d:%02d IST (Mon–Fri).",
             MARKET_OPEN_HOUR, MARKET_OPEN_MIN,
             MARKET_CLOSE_HOUR, MARKET_CLOSE_MIN,
         )
@@ -150,51 +193,80 @@ class WsTickerManager:
             self._scheduler.shutdown(wait=False)
             logger.info("WS scheduler shut down.")
 
-    # ------------------------------------------------------------------
+    # -------------------------------------------------------------------------
     # APScheduler callbacks
-    # ------------------------------------------------------------------
+    # -------------------------------------------------------------------------
 
     def _on_market_open(self) -> None:
-        logger.info(
-            "Market open at %s IST — starting WS ticker.",
-            datetime.now(IST).strftime("%H:%M:%S"),
-        )
+        logger.info("Market open at %s IST — starting WS ticker.", datetime.now(IST).strftime("%H:%M:%S"))
         try:
             self.start()
         except Exception as exc:
             logger.error("Failed to start WS ticker at market open: %s", exc)
 
     def _on_market_close(self) -> None:
-        logger.info(
-            "Market close at %s IST — stopping WS ticker.",
-            datetime.now(IST).strftime("%H:%M:%S"),
-        )
+        logger.info("Market close at %s IST — stopping WS ticker.", datetime.now(IST).strftime("%H:%M:%S"))
         self.stop()
 
-    # ------------------------------------------------------------------
+    def _on_instrument_refresh(self) -> None:
+        """
+        Refresh instrument_master for watched exchanges at 08:30 IST so
+        _on_connect uses the local DB cache instead of a live API call.
+        """
+        logger.info("Scheduled instrument master refresh starting.")
+        try:
+            kite = get_authenticated_kite()
+        except Exception as exc:
+            logger.error("Instrument refresh aborted — auth failed: %s", exc)
+            return
+
+        try:
+            watched   = get_watched_symbols()
+            exchanges = list({e["exchange"] for e in watched}) or ["NSE", "BSE"]
+        except Exception:
+            exchanges = ["NSE", "BSE"]
+
+        for exchange in exchanges:
+            try:
+                instruments = kite.instruments(exchange=exchange)
+                count       = upsert_instruments(exchange, instruments)
+                logger.info("Instrument master refreshed for %s: %d rows upserted", exchange, count)
+            except Exception as exc:
+                logger.error("Instrument master refresh failed for %s: %s", exchange, exc)
+
+    # -------------------------------------------------------------------------
     # Public control
-    # ------------------------------------------------------------------
+    # -------------------------------------------------------------------------
 
     def start(self) -> str:
         """
-        Authenticate, create KiteTicker, start the store thread, and connect.
+        Authenticate, create KiteTicker, launch N consumer threads, and connect.
         Returns 'started' | 'already_running'.
         """
         if self._running.is_set():
             return "already_running"
 
-        kite = get_authenticated_kite()
-        self._kws = KiteTicker(kite.api_key, kite.access_token)
+        kite      = get_authenticated_kite()
+        self._kws = KiteTicker(
+            kite.api_key,
+            kite.access_token,
+            debug=self._debug,
+            reconnect=True,
+            reconnect_max_tries=self._reconnect_max_tries,
+            reconnect_max_delay=self._reconnect_max_delay,
+            connect_timeout=self._connect_timeout,
+        )
 
-        # Wire up all callbacks
-        self._kws.on_ticks       = self._on_ticks
-        self._kws.on_connect     = self._on_connect
-        self._kws.on_close       = self._on_close
-        self._kws.on_error       = self._on_error
-        self._kws.on_reconnect   = self._on_reconnect
-        self._kws.on_noreconnect = self._on_noreconnect
+        self._kws.on_ticks        = self._on_ticks
+        self._kws.on_open         = self._on_open
+        self._kws.on_connect      = self._on_connect
+        self._kws.on_close        = self._on_close
+        self._kws.on_error        = self._on_error
+        self._kws.on_reconnect    = self._on_reconnect
+        self._kws.on_noreconnect  = self._on_noreconnect
+        self._kws.on_order_update = self._on_order_update
 
-        # Flush any leftover items from a previous run
+        # Drain leftover items from a previous run
         while not self._tick_queue.empty():
             try:
                 self._tick_queue.get_nowait()
@@ -203,23 +275,34 @@ class WsTickerManager:
 
         self._running.set()
 
-        # Consumer thread — started before connect so it is ready immediately
-        self._store_thread = threading.Thread(
-            target=self._store_loop,
-            name="ws-store",
-            daemon=True,
-        )
-        self._store_thread.start()
+        # Capture the current correlation ID so workers can log under the same ID
+        parent_cid = get_correlation_id()
 
-        # KiteTicker manages its own internal WebSocket thread
+        # Start N consumer threads before connecting — they must be ready when
+        # the first ticks arrive
+        self._store_threads = [
+            threading.Thread(
+                target=self._store_loop,
+                args=(parent_cid,),
+                name=f"ws-store-{i}",
+                daemon=True,
+            )
+            for i in range(self._num_workers)
+        ]
+        for t in self._store_threads:
+            t.start()
+
         self._kws.connect(threaded=True)
 
-        logger.info("WebSocket ticker started (mode=%s).", self._mode.upper())
+        logger.info(
+            "WebSocket ticker started (mode=%s, workers=%d).",
+            self._mode.upper(), self._num_workers,
+        )
         return "started"
 
     def stop(self) -> str:
         """
-        Close the WebSocket and drain the store thread cleanly.
+        Close the WebSocket, send one sentinel per consumer thread, and join all.
         Returns 'stopped' | 'not_running'.
         """
         if not self._running.is_set():
@@ -229,18 +312,35 @@ class WsTickerManager:
 
         if self._kws:
             try:
+                # stop_retry() halts the ReconnectingClientFactory so the
+                # reactor won't attempt further reconnects after close().
+                self._kws.stop_retry()
+            except Exception:
+                pass
+            try:
                 self._kws.close()
             except Exception:
                 pass
             self._kws = None
 
-        # Signal the store thread to finish draining and exit
-        self._tick_queue.put(_STOP_SENTINEL)
-        if self._store_thread and self._store_thread.is_alive():
-            self._store_thread.join(timeout=10)
+        # Send exactly one sentinel per worker so every thread exits cleanly
+        for _ in range(self._num_workers):
+            self._tick_queue.put(_STOP_SENTINEL)
 
-        logger.info("WebSocket ticker stopped.")
+        for t in self._store_threads:
+            if t.is_alive():
+                t.join(timeout=10)
+        self._store_threads = []
+
+        logger.info(
+            "WebSocket ticker stopped. Stored=%d  Dropped=%d",
+            self._ticks_stored, self._ticks_dropped,
+        )
         return "stopped"
+
+    # -------------------------------------------------------------------------
+    # Properties
+    # -------------------------------------------------------------------------
 
     @property
     def is_running(self) -> bool:
@@ -252,8 +352,23 @@ class WsTickerManager:
 
     @property
     def queue_depth(self) -> int:
-        """Number of tick batches waiting in the queue (useful for monitoring)."""
+        """Tick batches waiting in the bounded queue."""
         return self._tick_queue.qsize()
+
+    @property
+    def queue_capacity(self) -> int:
+        """Hard cap on queue size (QUEUE_MAX_SIZE)."""
+        return QUEUE_MAX_SIZE
+
+    @property
+    def ticks_dropped(self) -> int:
+        """Ticks dropped due to queue overflow since last start()."""
+        return self._ticks_dropped
+
+    @property
+    def ticks_stored(self) -> int:
+        """Ticks successfully written to MySQL since last start()."""
+        return self._ticks_stored
 
     @property
     def subscribed_symbols(self) -> list[str]:
@@ -264,15 +379,76 @@ class WsTickerManager:
         """ISO-8601 timestamp of the most recently received tick, or None."""
         return self._last_tick_at.isoformat() if self._last_tick_at else None
 
-    # ------------------------------------------------------------------
-    # KiteTicker callbacks — producer side (run in KiteTicker's thread)
-    # ------------------------------------------------------------------
+    @property
+    def is_connected(self) -> bool:
+        """True if the underlying WebSocket TCP connection is currently open."""
+        return bool(self._kws and self._kws.is_connected())
+
+    # -------------------------------------------------------------------------
+    # Dynamic symbol management
+    # -------------------------------------------------------------------------
+
+    def remove_symbol(self, symbol: str, exchange: str = "NSE") -> bool:
+        """
+        Remove a symbol from the persistent watch list **and** immediately
+        unsubscribe its instrument token if streaming is active.
+
+        Returns True if the symbol was found and removed from the DB.
+        """
+        removed = remove_watched_symbol(symbol.upper(), exchange.upper())
+
+        if removed and self._running.is_set() and self._kws:
+            token = next(
+                (tok for tok, meta in self._token_meta.items()
+                 if meta["symbol"] == symbol.upper()
+                 and meta["exchange"] == exchange.upper()),
+                None,
+            )
+            if token:
+                try:
+                    self._kws.unsubscribe([token])
+                    del self._token_meta[token]
+                    logger.info(
+                        "Unsubscribed %s:%s (token=%d) — live effect.",
+                        symbol.upper(), exchange.upper(), token,
+                    )
+                except Exception as exc:
+                    logger.warning("Unsubscribe failed for %s: %s", symbol.upper(), exc)
+
+        return removed
+
+    def set_symbol_modes(self, modes: dict[str, str]) -> None:
+        """
+        Override the subscription mode for specific symbols.
+
+        Example
+        -------
+        ``{"RELIANCE": "full", "INFY": "quote", "TCS": "ltp"}``
+
+        Symbols not listed continue to use the default ``mode`` passed
+        to the constructor.  Takes effect on the **next** connect / reconnect.
+        """
+        for sym, m in modes.items():
+            if m not in _VALID_MODES:
+                raise ValueError(f"Invalid mode '{m}' for {sym}. Choose from: {sorted(_VALID_MODES)}")
+            self._symbol_modes[sym.upper()] = m
+
+    # -------------------------------------------------------------------------
+    # KiteTicker callbacks — producer side  (KiteTicker's internal thread)
+    # -------------------------------------------------------------------------
+
+    def _on_open(self, ws) -> None:
+        """Fires after the WebSocket TCP handshake, before on_connect."""
+        logger.debug("WebSocket handshake complete (on_open).")
 
     def _on_connect(self, ws, response) -> None:
         """
-        Called once after the WebSocket handshake succeeds.
-        Resolves symbol strings → instrument tokens and subscribes.
-        KiteTicker also calls this automatically on every reconnect.
+        Resolve watch-list symbols → instrument tokens and subscribe.
+
+        Resolution order
+        ----------------
+        1. Local instrument_master DB cache  (populated by 08:30 IST job)
+        2. Live kite.instruments() API call  (on cache miss; also warms cache)
         """
         logger.info("WebSocket connected.")
         watched = get_watched_symbols()
@@ -280,22 +456,27 @@ class WsTickerManager:
             logger.info("No symbols in watch list — nothing to subscribe.")
             return
 
-        kite = get_authenticated_kite()
         self._token_meta.clear()
         tokens_to_subscribe: list[int] = []
 
-        # Group by exchange so we call kite.instruments() once per exchange
         by_exchange: dict[str, list[str]] = {}
         for entry in watched:
             by_exchange.setdefault(entry["exchange"], []).append(entry["symbol"])
 
         for exchange, symbols in by_exchange.items():
             try:
-                instruments = kite.instruments(exchange=exchange)
-                token_map = {
-                    inst["tradingsymbol"].upper(): inst["instrument_token"]
-                    for inst in instruments
-                }
+                token_map = _build_token_map_from_db(exchange)
+
+                if not token_map:
+                    logger.info("Instrument cache empty for %s — fetching from Kite API", exchange)
+                    kite      = get_authenticated_kite()
+                    live_insts = kite.instruments(exchange=exchange)
+                    upsert_instruments(exchange, live_insts)
+                    token_map = {
+                        inst["tradingsymbol"].upper(): inst["instrument_token"]
+                        for inst in live_insts
+                    }
+
                 for symbol in symbols:
                     token = token_map.get(symbol.upper())
                     if token:
@@ -305,33 +486,53 @@ class WsTickerManager:
                         }
                         tokens_to_subscribe.append(token)
                     else:
-                        logger.warning(
-                            "No instrument token found for %s:%s", exchange, symbol
-                        )
+                        logger.warning("No instrument token for %s:%s", exchange, symbol)
             except Exception as exc:
-                logger.error(
-                    "Instrument lookup failed for exchange %s: %s", exchange, exc
-                )
+                logger.error("Instrument lookup failed for %s: %s", exchange, exc)
 
         if tokens_to_subscribe:
             ws.subscribe(tokens_to_subscribe)
-            ws.set_mode(self._mode, tokens_to_subscribe)
+
+            # Apply per-symbol mode overrides; fall back to self._mode for
+            # any symbol not in self._symbol_modes.
+            modes_to_tokens: dict[str, list[int]] = {}
+            for token in tokens_to_subscribe:
+                sym  = self._token_meta[token]["symbol"]
+                mode = self._symbol_modes.get(sym, self._mode)
+                modes_to_tokens.setdefault(mode, []).append(token)
+
+            for mode, tokens_for_mode in modes_to_tokens.items():
+                ws.set_mode(mode, tokens_for_mode)
+
+            mode_summary = {
+                m: [self._token_meta[t]["symbol"] for t in toks]
+                for m, toks in modes_to_tokens.items()
+            }
             logger.info(
-                "Subscribed to %d instrument(s) in %s mode: %s",
-                len(tokens_to_subscribe),
-                self._mode.upper(),
-                [self._token_meta[t]["symbol"] for t in tokens_to_subscribe],
+                "Subscribed to %d instrument(s) — modes: %s",
+                len(tokens_to_subscribe), mode_summary,
             )
 
     def _on_ticks(self, ws, ticks: list[dict]) -> None:
         """
-        Called by KiteTicker's thread on every tick batch pushed by the exchange.
-        Puts the batch into the queue and records the arrival time.
-        Must return immediately — never block here.
+        Producer callback — must return immediately, never block.
+
+        Uses put_nowait() so the WebSocket thread is never stalled by a
+        full queue.  Dropped ticks are counted for monitoring.
         """
-        if ticks:
-            self._tick_queue.put(ticks)
+        if not ticks:
+            return
+        try:
+            self._tick_queue.put_nowait(ticks)
             self._last_tick_at = datetime.now(IST)
+        except queue.Full:
+            self._ticks_dropped += len(ticks)
+            logger.warning(
+                "Tick queue full (%d/%d) — dropped %d tick(s). "
+                "Total dropped this session: %d",
+                self._tick_queue.qsize(), QUEUE_MAX_SIZE,
+                len(ticks), self._ticks_dropped,
+            )
 
     def _on_close(self, ws, code, reason) -> None:
         logger.warning("WebSocket closed: code=%s  reason=%s", code, reason)
@@ -343,86 +544,147 @@ class WsTickerManager:
         logger.info("WebSocket reconnecting (attempt %d)...", attempts_count)
 
     def _on_noreconnect(self, ws) -> None:
-        """Max reconnect attempts exhausted — shut down gracefully."""
+        """Max reconnects exhausted — signal ALL consumer threads to exit."""
         logger.error("WebSocket max reconnect attempts reached — stopping.")
         self._running.clear()
-        self._tick_queue.put(_STOP_SENTINEL)
+        # One sentinel per worker so every thread wakes up and exits
+        for _ in range(self._num_workers):
+            self._tick_queue.put(_STOP_SENTINEL)
 
-    # ------------------------------------------------------------------
-    # Store loop — consumer side (runs in ws-store thread)
-    # ------------------------------------------------------------------
-
-    def _store_loop(self) -> None:
+    def _on_order_update(self, ws, data: dict) -> None:
         """
-        Drains tick batches from the queue and bulk-inserts into MySQL.
-
-        Accumulation strategy: after receiving the first batch from a blocking
-        get(), immediately drain all additional batches that have piled up
-        via non-blocking get_nowait() calls.  This turns many small inserts
-        into one larger bulk insert when the exchange pushes ticks faster than
-        the DB can absorb them.
-
-        Exits when it receives the _STOP_SENTINEL value.
+        Fires when an order placed via Kite changes state (filled, rejected,
+        cancelled, etc.).  Logs the event and persists it to ``order_updates``.
         """
+        order_id = data.get("order_id", "?")
+        status   = data.get("status", "?")
+        symbol   = data.get("tradingsymbol", "?")
+        logger.info(
+            "Order update: %s  %s  status=%s",
+            order_id, symbol, status,
+            extra={"order_id": order_id, "status": status, "symbol": symbol},
+        )
+        try:
+            row_id = save_order_update(data)
+            logger.debug("Order update persisted (id=%d).", row_id)
+        except Exception as exc:
+            logger.error("Failed to save order update %s: %s", order_id, exc)
+
+    # -------------------------------------------------------------------------
+    # Store loop — consumer side  (runs in each ws-store-N thread)
+    # -------------------------------------------------------------------------
+
+    def _store_loop(self, correlation_id: str = "") -> None:
+        """
+        Each consumer thread independently drains the shared queue and flushes
+        to MySQL.
+
+        Accumulation strategy
+        ---------------------
+        1. Block on queue.get(timeout=FLUSH_TIMEOUT).
+        2. On arrival, drain all immediately-available additional batches via
+           get_nowait() until either the queue is empty or BATCH_MAX is reached.
+        3. Flush the accumulated batch to MySQL.
+        4. On timeout (queue empty for FLUSH_TIMEOUT seconds), flush whatever
+           partial batch has accumulated — ensures low-traffic periods don't
+           leave ticks stranded in memory.
+        """
+        if correlation_id:
+            set_correlation_id(correlation_id)
         logger.info("WS store loop started.")
+
+        accumulated: list[dict] = []
+
         while True:
-            # Block until at least one batch arrives
-            first = self._tick_queue.get()
+            # ── wait for first item (with timeout for periodic partial flush) ──
+            try:
+                first = self._tick_queue.get(timeout=FLUSH_TIMEOUT)
+            except queue.Empty:
+                # Timeout — flush whatever we have accumulated so far
+                if accumulated:
+                    self._flush(accumulated)
+                    accumulated = []
+                # If we were told to stop between ticks, exit now
+                if not self._running.is_set():
+                    break
+                continue
+
             if first is _STOP_SENTINEL:
+                # Flush the last partial batch before exiting
+                if accumulated:
+                    self._flush(accumulated)
                 logger.info("WS store loop received sentinel — exiting.")
                 break
 
-            # Drain any additional batches that queued up while we waited
-            accumulated: list[dict] = list(first)
-            while True:
+            accumulated.extend(first)
+
+            # ── drain additional batches without blocking ──────────────────────
+            while len(accumulated) < BATCH_MAX:
                 try:
                     more = self._tick_queue.get_nowait()
                 except queue.Empty:
                     break
                 if more is _STOP_SENTINEL:
-                    # Flush what we have, then exit
                     self._flush(accumulated)
                     logger.info("WS store loop draining on sentinel — exiting.")
                     return
                 accumulated.extend(more)
 
-            self._flush(accumulated)
+            # ── flush when batch is at or above the cap ────────────────────────
+            if len(accumulated) >= BATCH_MAX:
+                self._flush(accumulated)
+                accumulated = []
+
         logger.info("WS store loop exited.")
 
     def _flush(self, raw_ticks: list[dict]) -> None:
-        """Normalize and persist a batch of raw KiteTicker ticks to tick_data."""
+        """
+        Normalise and persist a batch of raw KiteTicker ticks.
+
+        Retries up to FLUSH_RETRY_MAX times with exponential backoff on
+        transient MySQL errors.  Ticks are logged as lost only after all
+        retries are exhausted.
+        """
         try:
             normalized = _normalize_ticks(raw_ticks, self._token_meta)
-            if normalized:
-                saved = save_ticks(normalized)
-                logger.debug("WS stored %d tick(s).", saved)
+            if not normalized:
+                return
         except Exception as exc:
-            logger.error("WS DB store error: %s", exc, exc_info=True)
+            logger.error("Tick normalisation failed: %s", exc, exc_info=True)
+            return
+
+        last_exc: Exception | None = None
+        for attempt in range(1, FLUSH_RETRY_MAX + 1):
+            try:
+                saved = save_ticks(normalized)
+                self._ticks_stored += saved
+                logger.debug("WS stored %d tick(s) (attempt %d).", saved, attempt)
+                return
+            except Exception as exc:
+                last_exc = exc
+                if attempt < FLUSH_RETRY_MAX:
+                    wait = 0.1 * (2 ** (attempt - 1))   # 0.1 s, 0.2 s
+                    logger.warning(
+                        "Tick flush attempt %d/%d failed: %s — retrying in %.2fs",
+                        attempt, FLUSH_RETRY_MAX, exc, wait,
+                    )
+                    time.sleep(wait)
+
+        logger.error(
+            "Tick flush failed after %d attempts — %d tick(s) lost: %s",
+            FLUSH_RETRY_MAX, len(normalized), last_exc,
+        )
 
 
 # ---------------------------------------------------------------------------
-# Tick normalizer — maps KiteTicker wire format → save_ticks() format
+# Tick normalizer
 # ---------------------------------------------------------------------------
 
 def _normalize_ticks(
     raw_ticks: list[dict],
     token_meta: dict[int, dict],
 ) -> list[dict]:
-    """
-    Map KiteTicker raw tick fields → the dict format expected by save_ticks().
-
-    KiteTicker field       save_ticks() field
-    ─────────────────────  ──────────────────
-    instrument_token    →  instrument_token
-    last_price          →  last_price
-    volume_traded       →  volume
-    buy_quantity        →  buy_quantity
-    sell_quantity       →  sell_quantity
-    ohlc.open/high/low/close → open / high / low / close
-    change              →  change
-    (token_meta lookup) →  symbol, exchange
-    datetime.now(IST)   →  captured_at  (naive IST for MySQL storage)
-    """
+    """Map KiteTicker wire format → save_ticks() dict format."""
     captured_at = datetime.now(IST).replace(tzinfo=None)
     result      = []
 
@@ -430,23 +692,52 @@ def _normalize_ticks(
         token = t.get("instrument_token", 0)
         meta  = token_meta.get(token, {})
         ohlc  = t.get("ohlc", {})
+
+        # exchange_timestamp / last_trade_time arrive as tz-aware datetimes
+        # from KiteTicker; strip tzinfo so MySQL DATETIME(3) accepts them.
+        def _strip_tz(dt):
+            if dt is None:
+                return None
+            return dt.replace(tzinfo=None) if hasattr(dt, "tzinfo") else dt
+
         result.append({
-            "symbol":           meta.get("symbol", str(token)),
-            "exchange":         meta.get("exchange", ""),
-            "instrument_token": token,
-            "last_price":       t.get("last_price", 0.0),
-            "volume":           t.get("volume_traded", 0),
-            "buy_quantity":     t.get("buy_quantity", 0),
-            "sell_quantity":    t.get("sell_quantity", 0),
-            "open":             ohlc.get("open"),
-            "high":             ohlc.get("high"),
-            "low":              ohlc.get("low"),
-            "close":            ohlc.get("close"),
-            "change":           t.get("change"),
-            "captured_at":      captured_at,
+            "symbol":                meta.get("symbol", str(token)),
+            "exchange":              meta.get("exchange", ""),
+            "instrument_token":      token,
+            "last_price":            t.get("last_price", 0.0),
+            "volume":                t.get("volume_traded", 0),
+            "buy_quantity":          t.get("total_buy_quantity", 0),
+            "sell_quantity":         t.get("total_sell_quantity", 0),
+            "open":                  ohlc.get("open"),
+            "high":                  ohlc.get("high"),
+            "low":                   ohlc.get("low"),
+            "close":                 ohlc.get("close"),
+            "change":                t.get("change"),
+            "last_traded_quantity":  t.get("last_traded_quantity", 0),
+            "avg_traded_price":      t.get("average_traded_price"),
+            "oi":                    t.get("oi", 0),
+            "oi_day_high":           t.get("oi_day_high", 0),
+            "oi_day_low":            t.get("oi_day_low", 0),
+            "last_trade_time":       _strip_tz(t.get("last_trade_time")),
+            "exchange_timestamp":    _strip_tz(t.get("exchange_timestamp")),
+            "depth":                 t.get("depth"),
+            "captured_at":           captured_at,
         })
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _build_token_map_from_db(exchange: str) -> dict[str, int]:
+    """
+    Return ``{tradingsymbol.upper(): instrument_token}`` from the local cache.
+    Returns an empty dict when the cache is empty or unavailable.
+    """
+    rows = get_instruments_for_exchange(exchange)
+    return {row["tradingsymbol"].upper(): int(row["instrument_token"]) for row in rows}
 
 
 # Module-level singleton — imported by api.py

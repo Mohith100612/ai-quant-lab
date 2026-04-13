@@ -1,0 +1,33 @@
+[Unit]
+Description=ai-quant-lab — Zerodha Kite Connect FastAPI server
+Documentation=https://github.com/your-org/ai-quant-lab
+After=network.target
+
+[Service]
+Type=simple
+User=quant
+WorkingDirectory=/opt/ai-quant-lab/app
+ExecStart=/opt/ai-quant-lab/venv/bin/python run.py server
+Restart=on-failure
+RestartSec=5
+
+# Give the process enough time to drain the WebSocket queue on shutdown
+TimeoutStopSec=30
+
+# Keep logs in journald (accessible via journalctl -u ai_quant_lab)
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ai_quant_lab
+
+# Security hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ReadWritePaths=/opt/ai-quant-lab/app
+
+# Environment — override individual vars without touching .env
+# (secrets should live in /opt/ai-quant-lab/app/.env)
+EnvironmentFile=-/opt/ai-quant-lab/app/.env
+
+[Install]
+WantedBy=multi-user.target

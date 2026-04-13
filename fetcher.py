@@ -9,13 +9,16 @@ Given a trading symbol, exchange, date range, and candle interval this module:
 
 from __future__ import annotations
 
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from typing import Union
 
 import pandas as pd
 from kiteconnect import KiteConnect
 
 from exceptions import KiteAPIError, SymbolNotFoundError, InvalidIntervalError
+from log_config import get_logger
+
+logger = get_logger(__name__)
 
 # Candle intervals supported by Kite Connect
 VALID_INTERVALS = {
@@ -44,11 +47,30 @@ def lookup_instrument_token(
     """
     Return the instrument_token for `symbol` on `exchange`.
 
+    Resolution order
+    ----------------
+    1. Check the local ``instrument_master`` DB cache (fast, no API call).
+    2. On cache miss, fetch the full instrument list from Kite and return the
+       matching token (the cache is *not* populated here — use
+       ``refresh_instrument_master()`` for bulk warming).
+
     Raises
     ------
     SymbolNotFoundError  if the symbol does not exist on the exchange.
     KiteAPIError         if the instruments list cannot be fetched.
     """
+    from database import get_instrument_token_from_db
+
+    # ── Fast path: local DB cache ──────────────────────────────────────────
+    cached = get_instrument_token_from_db(symbol, exchange)
+    if cached is not None:
+        return cached
+
+    # ── Slow path: live Kite API call ──────────────────────────────────────
+    logger.debug(
+        "Instrument cache miss for %s:%s — fetching from Kite API",
+        exchange, symbol,
+    )
     try:
         instruments = kite.instruments(exchange=exchange)
     except Exception as exc:
@@ -81,14 +103,67 @@ def lookup_instrument_token(
         )
 
     if len(matches) > 1:
-        print(
-            f"WARNING: Multiple instruments match '{symbol}' on {exchange}. "
-            f"Using the first: {matches[0]['tradingsymbol']} "
-            f"(token={matches[0]['instrument_token']}, "
-            f"name='{matches[0]['name']}')."
+        logger.warning(
+            "Multiple instruments match '%s' on %s — using first: %s (token=%s, name='%s')",
+            symbol, exchange,
+            matches[0]["tradingsymbol"],
+            matches[0]["instrument_token"],
+            matches[0]["name"],
         )
 
     return int(matches[0]["instrument_token"])
+
+
+def refresh_instrument_master(
+    kite:          KiteConnect,
+    exchanges:     list[str] | None = None,
+    max_age_hours: float = 24.0,
+) -> dict[str, int]:
+    """
+    Fetch the full instrument list for each exchange from Kite and persist it
+    to the ``instrument_master`` DB table.
+
+    Staleness check
+    ---------------
+    If the cached data for an exchange is younger than *max_age_hours* the
+    exchange is skipped.  Pass ``max_age_hours=0`` to force a full refresh.
+
+    Returns
+    -------
+    A dict mapping ``{exchange: rows_upserted}``.  Exchanges that were
+    skipped because their cache was fresh have a value of ``0``.
+    """
+    from database import upsert_instruments, get_instruments_refreshed_at
+
+    exchanges = exchanges or ["NSE", "BSE", "NFO", "MCX"]
+    now       = datetime.utcnow()
+    results: dict[str, int] = {}
+
+    for exchange in exchanges:
+        if max_age_hours > 0:
+            last = get_instruments_refreshed_at(exchange)
+            if last and (now - last) < timedelta(hours=max_age_hours):
+                logger.info(
+                    "Instrument master for %s is fresh (age < %.0fh) — skipping",
+                    exchange, max_age_hours,
+                )
+                results[exchange] = 0
+                continue
+
+        try:
+            instruments = kite.instruments(exchange=exchange)
+            count       = upsert_instruments(exchange, instruments)
+            logger.info(
+                "Instrument master refreshed for %s: %d rows upserted",
+                exchange, count,
+            )
+            results[exchange] = count
+        except Exception as exc:
+            raise KiteAPIError(
+                f"Failed to refresh instrument master for {exchange}: {exc}"
+            ) from exc
+
+    return results
 
 
 def fetch_historical_data(
@@ -132,19 +207,18 @@ def fetch_historical_data(
     delta_days = (to_dt - from_dt).days
     max_days   = INTERVAL_MAX_DAYS[interval]
     if delta_days > max_days:
-        print(
-            f"WARNING: The requested range ({delta_days} days) exceeds the "
-            f"Kite Connect limit of {max_days} days for '{interval}' candles. "
-            f"The API may return partial data or raise an error."
+        logger.warning(
+            "Requested range (%d days) exceeds Kite limit of %d days for '%s' candles — "
+            "API may return partial data or raise an error.",
+            delta_days, max_days, interval,
         )
 
     # Raises SymbolNotFoundError / KiteAPIError if lookup fails
     instrument_token = lookup_instrument_token(kite, symbol, exchange)
 
-    print(
-        f"Fetching {interval} candles for {symbol} ({exchange}) "
-        f"from {from_dt.date()} to {to_dt.date()} "
-        f"[token={instrument_token}] …"
+    logger.info(
+        "Fetching %s candles for %s (%s) from %s to %s [token=%s]",
+        interval, symbol, exchange, from_dt.date(), to_dt.date(), instrument_token,
     )
 
     try:
@@ -163,7 +237,7 @@ def fetch_historical_data(
         ) from exc
 
     if not records:
-        print("No data returned for the given parameters.")
+        logger.warning("No data returned for %s (%s) [%s → %s].", symbol, exchange, from_dt.date(), to_dt.date())
         return pd.DataFrame(), instrument_token
 
     try:
@@ -176,7 +250,7 @@ def fetch_historical_data(
             f"Failed to parse historical data response for {symbol}: {exc}"
         ) from exc
 
-    print(f"Retrieved {len(df)} candles.")
+    logger.info("Retrieved %d candles for %s (%s).", len(df), symbol, exchange)
     return df, instrument_token
 
 
