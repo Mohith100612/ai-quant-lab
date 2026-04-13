@@ -26,15 +26,20 @@ import yaml
 import pandas as pd
 
 from auth import get_authenticated_kite
-from database import ensure_table, data_exists, find_missing_date_ranges, save_to_db
+from database import (
+    ensure_table, ensure_extended_tables,
+    data_exists, find_missing_date_ranges, save_to_db,
+    push_to_dlq,
+)
 from fetcher import fetch_historical_data, _to_datetime, INTERVAL_MAX_DAYS, VALID_INTERVALS
+from log_config import configure_logging, get_logger, new_correlation_id, set_correlation_id
 
-_print_lock = threading.Lock()
+configure_logging()
+logger = get_logger(__name__)
 
-
-def _safe_print(*args, **kwargs):
-    with _print_lock:
-        print(*args, **kwargs)
+# Limit concurrent Kite API calls across all worker threads to avoid rate-limit
+# errors (Kite enforces ~3 req/s per session on historical data endpoints).
+_API_SEMAPHORE = threading.Semaphore(3)
 
 
 # ---------------------------------------------------------------------------
@@ -42,6 +47,7 @@ def _safe_print(*args, **kwargs):
 # ---------------------------------------------------------------------------
 
 REQUIRED_KEYS = {"pipeline_name", "data_source", "date_range"}
+
 
 def load_config(path: str) -> dict:
     cfg_path = Path(path)
@@ -91,20 +97,35 @@ def _fetch_one(
     oi: bool,
     max_attempts: int,
     backoff_secs: float,
-) -> tuple[str, str]:
+    correlation_id: str = "",
+) -> tuple[str, str, str]:
     """
-    Fetch and save one symbol. Returns (symbol, status) where status is one of
-    'fetched', 'skipped', or 'failed'.
+    Fetch and save one symbol.
+
+    Returns
+    -------
+    (symbol, status, error_msg) where status is 'fetched' | 'skipped' | 'failed'
+    and error_msg is the last exception message on failure, else ''.
     """
+    # Inherit the parent pipeline's correlation ID so every worker thread's
+    # log lines share the same trace ID.
+    if correlation_id:
+        set_correlation_id(correlation_id)
+
     # Find only the sub-ranges not yet in the DB (gap detection)
     gaps = find_missing_date_ranges(symbol, exchange, interval, from_dt, to_dt)
 
     if not gaps:
-        _safe_print(f"  [SKIP]  {symbol} — fully covered in DB")
-        return symbol, "skipped"
+        logger.info("Skipping %s — fully covered in DB", symbol, extra={"symbol": symbol, "status": "skipped"})
+        return symbol, "skipped", ""
 
-    _safe_print(f"  [GAP]   {symbol} — {len(gaps)} missing range(s) to fetch")
+    logger.info(
+        "%s — %d missing range(s) to fetch",
+        symbol, len(gaps),
+        extra={"symbol": symbol, "gaps": len(gaps)},
+    )
 
+    last_error = ""
     for gap_from, gap_to in gaps:
         for attempt in range(1, max_attempts + 1):
             try:
@@ -113,16 +134,19 @@ def _fetch_one(
 
                 while cur <= gap_to:
                     end = min(cur + chunk, gap_to)
-                    df, tok = fetch_historical_data(
-                        kite=kite,
-                        symbol=symbol,
-                        from_date=cur,
-                        to_date=end,
-                        interval=interval,
-                        exchange=exchange,
-                        continuous=continuous,
-                        oi=oi,
-                    )
+                    # Semaphore caps parallel API requests at 3 to stay within
+                    # Kite's rate limit on the historical data endpoint.
+                    with _API_SEMAPHORE:
+                        df, tok = fetch_historical_data(
+                            kite=kite,
+                            symbol=symbol,
+                            from_date=cur,
+                            to_date=end,
+                            interval=interval,
+                            exchange=exchange,
+                            continuous=continuous,
+                            oi=oi,
+                        )
                     if not df.empty:
                         all_frames.append(df)
                         token = tok
@@ -135,33 +159,44 @@ def _fetch_one(
                         full_df, symbol, token, exchange,
                         interval, gap_from, gap_to,
                     )
-                    _safe_print(
-                        f"  [OK]    {symbol} "
-                        f"[{gap_from.date()} → {gap_to.date()}] — {rows} rows saved"
+                    logger.info(
+                        "%s [%s → %s] — %d rows saved",
+                        symbol, gap_from.date(), gap_to.date(), rows,
+                        extra={"symbol": symbol, "rows_saved": rows, "status": "ok"},
                     )
                 else:
-                    _safe_print(
-                        f"  [WARN]  {symbol} "
-                        f"[{gap_from.date()} → {gap_to.date()}] — no data from API"
+                    logger.warning(
+                        "%s [%s → %s] — no data from API",
+                        symbol, gap_from.date(), gap_to.date(),
+                        extra={"symbol": symbol, "status": "no_data"},
                     )
                 break   # gap succeeded — move to next gap
 
             except Exception as exc:
+                last_error = str(exc)
                 if attempt < max_attempts:
                     wait = min(backoff_secs * (2 ** (attempt - 1)), 60.0)
-                    _safe_print(
-                        f"  [RETRY] {symbol} (attempt {attempt}/{max_attempts}): "
-                        f"{exc} — retrying in {wait:.1f}s"
+                    logger.warning(
+                        "%s attempt %d/%d failed: %s — retrying in %.1fs",
+                        symbol, attempt, max_attempts, exc, wait,
+                        extra={"symbol": symbol, "attempt": attempt, "wait_secs": wait},
                     )
                     time.sleep(wait)
                 else:
-                    _safe_print(f"  [FAIL]  {symbol} — {exc}")
-                    return symbol, "failed"
+                    logger.error(
+                        "%s — all %d attempts exhausted: %s",
+                        symbol, max_attempts, exc,
+                        extra={"symbol": symbol, "attempts": max_attempts, "status": "failed"},
+                    )
+                    return symbol, "failed", last_error
 
-    return symbol, "fetched"
+    return symbol, "fetched", ""
 
 
 def run_pipeline(cfg: dict, dry_run: bool = False, workers: int = 4) -> dict:
+    cid = new_correlation_id()
+    set_correlation_id(cid)
+
     name        = cfg.get("pipeline_name", "unnamed")
     description = cfg.get("description", "")
     src         = cfg["data_source"]
@@ -181,27 +216,32 @@ def run_pipeline(cfg: dict, dry_run: bool = False, workers: int = 4) -> dict:
 
     effective_workers = min(workers, len(symbols)) if symbols else 1
 
-    print(f"\n{'='*60}")
-    print(f"Pipeline : {name}")
-    if description:
-        print(f"           {description}")
-    print(f"Exchange : {exchange}  |  Interval: {interval}")
-    print(f"Range    : {from_dt.date()} → {to_dt.date()}")
-    print(f"Symbols  : {len(symbols)} instruments  |  Workers: {effective_workers}")
-    print(f"{'='*60}")
+    logger.info(
+        "Pipeline '%s' starting",
+        name,
+        extra={
+            "pipeline": name,
+            "exchange": exchange,
+            "interval": interval,
+            "from":     str(from_dt.date()),
+            "to":       str(to_dt.date()),
+            "symbols":  len(symbols),
+            "workers":  effective_workers,
+            "dry_run":  dry_run,
+        },
+    )
 
     if dry_run:
-        print("[dry-run] Symbols that would be fetched:")
-        for s in symbols:
-            print(f"  - {s}")
-        print("[dry-run] No data fetched or saved.")
+        logger.info("dry-run mode — no data fetched or saved", extra={"symbols": symbols})
         return {}
 
     ensure_table()
+    ensure_extended_tables()
     kite  = get_authenticated_kite()
     chunk = timedelta(days=INTERVAL_MAX_DAYS.get(interval, 60) - 1)
 
-    results: dict[str, list] = {"fetched": [], "skipped": [], "failed": []}
+    results: dict[str, list]  = {"fetched": [], "skipped": [], "failed": []}
+    errors:  dict[str, str]   = {}   # symbol → last error message
 
     with ThreadPoolExecutor(max_workers=effective_workers) as executor:
         futures = {
@@ -210,22 +250,58 @@ def run_pipeline(cfg: dict, dry_run: bool = False, workers: int = 4) -> dict:
                 symbol, kite, exchange, interval,
                 from_dt, to_dt, chunk,
                 continuous, oi, max_attempts, backoff_secs,
+                cid,   # propagate correlation_id so worker logs share the trace
             ): symbol
             for symbol in symbols
         }
 
         for future in as_completed(futures):
-            symbol, status = future.result()
+            symbol, status, error_msg = future.result()
             results[status].append(symbol)
+            if status == "failed":
+                errors[symbol] = error_msg
 
-    # Summary
-    print(f"\n{'='*60}")
-    print(f"Done: {len(results['fetched'])} fetched, "
-          f"{len(results['skipped'])} skipped, "
-          f"{len(results['failed'])} failed")
+    # ── Persist failed symbols to the dead-letter queue ───────────────────
     if results["failed"]:
-        print(f"Failed symbols: {results['failed']}")
-    print(f"{'='*60}\n")
+        logger.error(
+            "Pipeline '%s' — %d symbol(s) failed; writing to dead-letter queue",
+            name, len(results["failed"]),
+            extra={"failed_symbols": results["failed"]},
+        )
+        for symbol in results["failed"]:
+            try:
+                dlq_id = push_to_dlq(
+                    symbol=symbol,
+                    exchange=exchange,
+                    interval=interval,
+                    from_dt=from_dt,
+                    to_dt=to_dt,
+                    error_msg=errors.get(symbol, ""),
+                    pipeline_name=name,
+                )
+                logger.warning(
+                    "DLQ entry created for %s (id=%d)", symbol, dlq_id,
+                    extra={"symbol": symbol, "dlq_id": dlq_id},
+                )
+            except Exception as dlq_exc:
+                logger.error(
+                    "Failed to write %s to DLQ: %s", symbol, dlq_exc,
+                    extra={"symbol": symbol},
+                )
+
+    logger.info(
+        "Pipeline '%s' complete — fetched=%d skipped=%d failed=%d",
+        name,
+        len(results["fetched"]),
+        len(results["skipped"]),
+        len(results["failed"]),
+        extra={
+            "pipeline":       name,
+            "fetched_count":  len(results["fetched"]),
+            "skipped_count":  len(results["skipped"]),
+            "failed_count":   len(results["failed"]),
+        },
+    )
 
     return results
 

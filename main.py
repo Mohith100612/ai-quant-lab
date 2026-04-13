@@ -23,7 +23,11 @@ import pandas as pd
 
 from auth import get_authenticated_kite
 from fetcher import fetch_historical_data, VALID_INTERVALS, _to_datetime
-from database import ensure_table, data_exists, save_to_db
+from database import ensure_table, ensure_extended_tables, data_exists, save_to_db
+from log_config import configure_logging, get_logger, new_correlation_id, set_correlation_id
+
+configure_logging()
+logger = get_logger(__name__)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -81,46 +85,48 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main():
+    set_correlation_id(new_correlation_id())
+
     parser = build_parser()
-    args = parser.parse_args()
-    print("[DEBUG] Arguments parsed successfully")
+    args   = parser.parse_args()
 
     symbol   = args.symbol
     exchange = args.exchange.upper()
     interval = args.interval
 
-    # Parse dates once so we can reuse them for both DB checks and the API call
     from_dt = _to_datetime(args.from_date, is_start=True)
     to_dt   = _to_datetime(args.to_date,   is_start=False)
-    print(f"[DEBUG] Date range: {from_dt} to {to_dt}")
+    logger.debug("Date range parsed", extra={"from": str(from_dt), "to": str(to_dt)})
 
-    # Ensure the MySQL table exists
-    print("[DEBUG] Initializing database...")
+    logger.info("Initialising database tables")
     ensure_table()
-    print("[DEBUG] Database table ready")
+    ensure_extended_tables()
 
     if data_exists(symbol, exchange, interval, from_dt, to_dt):
-        print("Data is already present in the database.")
+        logger.info("Data already present in DB for %s — nothing to fetch", symbol)
         sys.exit(0)
-    else:
-        print("[DEBUG] Data not found in DB, fetching from Kite API...")
-        kite = get_authenticated_kite()
-        df, instrument_token = fetch_historical_data(
-            kite=kite,
-            symbol=symbol,
-            from_date=from_dt,
-            to_date=to_dt,
-            interval=interval,
-            exchange=exchange,
-            continuous=args.continuous,
-            oi=args.oi,
-        )
-        if not df.empty:
-            rows_saved = save_to_db(df, symbol, instrument_token, exchange, interval, from_dt, to_dt)
-            print(f"Saved {rows_saved} candle(s) to the stock_data table.")
+
+    logger.info(
+        "Fetching %s (%s) %s candles from %s to %s",
+        symbol, exchange, interval, from_dt.date(), to_dt.date(),
+    )
+    kite = get_authenticated_kite()
+    df, instrument_token = fetch_historical_data(
+        kite=kite,
+        symbol=symbol,
+        from_date=from_dt,
+        to_date=to_dt,
+        interval=interval,
+        exchange=exchange,
+        continuous=args.continuous,
+        oi=args.oi,
+    )
+    if not df.empty:
+        rows_saved = save_to_db(df, symbol, instrument_token, exchange, interval, from_dt, to_dt)
+        logger.info("Saved %d candle(s) to stock_data", rows_saved, extra={"rows_saved": rows_saved})
 
     if df.empty:
-        print("No data to display.")
+        logger.warning("No data returned for %s", symbol)
         sys.exit(0)
 
     # Display a preview
@@ -132,7 +138,7 @@ def main():
     if args.output:
         out_path = os.path.join(os.path.dirname(__file__), args.output)
         df.to_csv(out_path)
-        print(f"\nSaved to {out_path}")
+        logger.info("Saved to %s", out_path)
 
 
 if __name__ == "__main__":
