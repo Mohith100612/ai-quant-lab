@@ -3,19 +3,19 @@ Zerodha Kite Connect — FastAPI server.
 
 Endpoints
 ---------
-GET  /auth/login-url        → Kite login URL to open in browser
-POST /auth/session          → Exchange request_token for access_token
+GET  /auth/login-url               → Kite login URL to open in browser
+POST /auth/session                 → Exchange request_token for access_token
 
-GET  /candles               → Check DB first; if missing fetch from Kite, save, return
+GET  /candles                      → Check DB first; if missing fetch from Kite, save, return
 
-POST /ticker/watch          → Add a symbol to the real-time watch list
-DEL  /ticker/watch/{symbol} → Remove a symbol from the watch list
-GET  /ticker/watch          → List all watched symbols
-POST /ticker/start          → Manually start real-time polling
-POST /ticker/stop           → Manually stop real-time polling
-GET  /ticker/status         → Is the ticker running?
+POST /ws-ticker/watch              → Add a symbol to the WebSocket watch list
+DEL  /ws-ticker/watch/{symbol}     → Remove a symbol from the watch list
+GET  /ws-ticker/watch              → List all watched symbols
+POST /ws-ticker/start              → Manually start WebSocket streaming
+POST /ws-ticker/stop               → Manually stop WebSocket streaming
+GET  /ws-ticker/status             → Streaming state, subscribed symbols, scheduler info
 
-GET  /ticks                 → Query stored 1-second tick snapshots
+GET  /ticks                        → Query stored real-time tick snapshots
 
 Run
 ---
@@ -40,8 +40,9 @@ from database import (
     ensure_table, data_exists, save_to_db, _get_connection,
     ensure_tick_tables,
     get_watched_symbols, add_watched_symbol, remove_watched_symbol,
+    query_tick_data,
 )
-from ticker import ticker_manager
+from ws_ticker import ws_ticker_manager
 
 logger = logging.getLogger(__name__)
 
@@ -58,17 +59,17 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         logger.error("Could not create tick tables: %s", exc)
 
-    ticker_manager.start_scheduler()   # registers 09:15 / 15:30 cron jobs
+    ws_ticker_manager.start_scheduler()    # 09:15 / 15:30 IST (Mon–Fri)
 
     yield   # ← application runs here
 
     # ── Shutdown ─────────────────────────────────────────────────────────────
-    ticker_manager.stop_scheduler()
+    ws_ticker_manager.stop_scheduler()
 
 
 app = FastAPI(
     title="Zerodha Kite Connect API",
-    description="REST wrapper around Kite Connect with real-time tick collection",
+    description="REST wrapper around Kite Connect with WebSocket real-time tick streaming",
     version="2.0.0",
     lifespan=lifespan,
 )
@@ -116,6 +117,7 @@ def create_session(body: SessionRequest):
 
 
 # ---------------------------------------------------------------------------
+# Candles
 # ---------------------------------------------------------------------------
 
 @app.get("/candles", tags=["Candles"])
@@ -210,7 +212,7 @@ def get_candles(
 
 
 # ---------------------------------------------------------------------------
-# Ticker — watch list management
+# WebSocket Ticker — watch list
 # ---------------------------------------------------------------------------
 
 class WatchRequest(BaseModel):
@@ -218,9 +220,9 @@ class WatchRequest(BaseModel):
     exchange: str = "NSE"
 
 
-@app.post("/ticker/watch", tags=["Ticker"])
+@app.post("/ws-ticker/watch", tags=["WebSocket Ticker"])
 def add_symbol_to_watch(body: WatchRequest):
-    """Add a symbol to the real-time watch list (starts collecting at next 09:15 IST)."""
+    """Add a symbol to the WebSocket watch list. Takes effect on the next connect or reconnect."""
     try:
         inserted = add_watched_symbol(body.symbol, body.exchange)
     except Exception as exc:
@@ -232,12 +234,12 @@ def add_symbol_to_watch(body: WatchRequest):
     }
 
 
-@app.delete("/ticker/watch/{symbol}", tags=["Ticker"])
+@app.delete("/ws-ticker/watch/{symbol}", tags=["WebSocket Ticker"])
 def remove_symbol_from_watch(
     symbol:   str,
     exchange: str = Query("NSE", description="Exchange: NSE, BSE, NFO, MCX"),
 ):
-    """Remove a symbol from the real-time watch list."""
+    """Remove a symbol from the WebSocket watch list."""
     try:
         deleted = remove_watched_symbol(symbol, exchange)
     except Exception as exc:
@@ -250,9 +252,9 @@ def remove_symbol_from_watch(
     return {"symbol": symbol.upper(), "exchange": exchange.upper(), "status": "removed"}
 
 
-@app.get("/ticker/watch", tags=["Ticker"])
+@app.get("/ws-ticker/watch", tags=["WebSocket Ticker"])
 def list_watched_symbols():
-    """List all symbols currently in the real-time watch list."""
+    """List all symbols currently in the WebSocket watch list."""
     try:
         symbols = get_watched_symbols()
     except Exception as exc:
@@ -261,43 +263,50 @@ def list_watched_symbols():
 
 
 # ---------------------------------------------------------------------------
-# Ticker — manual start / stop / status
+# WebSocket Ticker — control & status
 # ---------------------------------------------------------------------------
 
-@app.post("/ticker/start", tags=["Ticker"])
-def start_ticker():
-    """Manually start real-time polling (without waiting for 09:15 IST)."""
+@app.post("/ws-ticker/start", tags=["WebSocket Ticker"])
+def start_ws_ticker():
+    """
+    Manually start KiteTicker WebSocket streaming.
+    Resolves all watched symbols to instrument tokens and subscribes.
+    Ticks are persisted in real time via the producer-consumer queue.
+    """
     try:
-        status = ticker_manager.start_polling()
+        status = ws_ticker_manager.start()
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
     return {"status": status}
 
 
-@app.post("/ticker/stop", tags=["Ticker"])
-def stop_ticker():
-    """Manually stop real-time polling."""
-    return {"status": ticker_manager.stop_polling()}
+@app.post("/ws-ticker/stop", tags=["WebSocket Ticker"])
+def stop_ws_ticker():
+    """Manually stop KiteTicker WebSocket streaming and drain the store queue."""
+    return {"status": ws_ticker_manager.stop()}
 
 
-@app.get("/ticker/status", tags=["Ticker"])
-def ticker_status():
-    """Return whether the ticker is running and how many symbols are watched."""
+@app.get("/ws-ticker/status", tags=["WebSocket Ticker"])
+def ws_ticker_status():
+    """Return streaming state, subscribed symbols, queue depth, and scheduler info."""
     try:
         count = len(get_watched_symbols())
     except Exception:
         count = 0
     return {
-        "polling_active":   ticker_manager.is_running,
-        "scheduler_active": ticker_manager.scheduler_running,
-        "watched_count":    count,
-        "auto_start":       "09:15 IST (Mon–Fri)",
-        "auto_stop":        "15:30 IST (Mon–Fri)",
+        "streaming_active":   ws_ticker_manager.is_running,
+        "scheduler_active":   ws_ticker_manager.scheduler_running,
+        "subscribed_symbols": ws_ticker_manager.subscribed_symbols,
+        "watched_count":      count,
+        "queue_depth":        ws_ticker_manager.queue_depth,
+        "last_tick_at":       ws_ticker_manager.last_tick_at,
+        "auto_start":         "09:15 IST (Mon–Fri)",
+        "auto_stop":          "15:30 IST (Mon–Fri)",
     }
 
 
 # ---------------------------------------------------------------------------
-# Ticks — query stored 1-second snapshots
+# Ticks — query stored real-time snapshots
 # ---------------------------------------------------------------------------
 
 @app.get("/ticks", tags=["Ticks"])
@@ -307,7 +316,7 @@ def get_ticks(
     to_dt:   str = Query(...,   alias="to",   description="End:   YYYY-MM-DD or YYYY-MM-DD HH:MM:SS"),
     limit:   int = Query(3600,  description="Max rows (default 3600 = 1 hour, max 86400)", ge=1, le=86400),
 ):
-    """Query real-time 1-second tick snapshots from stock_data for a symbol within a time range."""
+    """Query real-time tick snapshots from tick_data for a symbol within a time range."""
     try:
         from_parsed = _to_datetime(from_dt, is_start=True)
         to_parsed   = _to_datetime(to_dt,   is_start=False)
@@ -318,35 +327,23 @@ def get_ticks(
         raise HTTPException(status_code=422, detail="from must be earlier than to")
 
     try:
-        conn   = _get_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            SELECT instrument_token, symbol, timestamp,
-                   open, high, low, close, volume
-              FROM stock_data
-             WHERE symbol    = %s
-               AND timestamp BETWEEN %s AND %s
-             ORDER BY timestamp ASC
-             LIMIT %s
-            """,
-            (symbol.upper(), from_parsed, to_parsed, limit),
-        )
-        rows = cursor.fetchall()
-        cursor.close()
-        conn.close()
+        rows = query_tick_data(symbol, from_parsed, to_parsed, limit)
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"Database query failed: {exc}")
 
     ticks = [
         {
-            "timestamp":        row["timestamp"].isoformat() if hasattr(row["timestamp"], "isoformat") else str(row["timestamp"]),
-            "open":             float(row["open"])   if row["open"]   is not None else None,
-            "high":             float(row["high"])   if row["high"]   is not None else None,
-            "low":              float(row["low"])    if row["low"]    is not None else None,
-            "close":            float(row["close"])  if row["close"]  is not None else None,
-            "volume":           int(row["volume"])   if row["volume"] is not None else 0,
+            "timestamp":        row["captured_at"].isoformat() if hasattr(row["captured_at"], "isoformat") else str(row["captured_at"]),
             "instrument_token": int(row["instrument_token"]),
+            "last_price":       float(row["last_price"]),
+            "open":             float(row["open"])        if row["open"]         is not None else None,
+            "high":             float(row["high"])        if row["high"]         is not None else None,
+            "low":              float(row["low"])         if row["low"]          is not None else None,
+            "close":            float(row["close"])       if row["close"]        is not None else None,
+            "volume":           int(row["volume"])        if row["volume"]       is not None else 0,
+            "buy_quantity":     int(row["buy_quantity"])  if row["buy_quantity"] is not None else 0,
+            "sell_quantity":    int(row["sell_quantity"]) if row["sell_quantity"] is not None else 0,
+            "change_pct":       float(row["change_pct"]) if row["change_pct"]   is not None else None,
         }
         for row in rows
     ]

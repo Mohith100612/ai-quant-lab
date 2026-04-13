@@ -9,12 +9,13 @@ Given a trading symbol, exchange, date range, and candle interval this module:
 
 from __future__ import annotations
 
-import sys
 from datetime import datetime, date
 from typing import Union
 
 import pandas as pd
 from kiteconnect import KiteConnect
+
+from exceptions import KiteAPIError, SymbolNotFoundError, InvalidIntervalError
 
 # Candle intervals supported by Kite Connect
 VALID_INTERVALS = {
@@ -43,30 +44,39 @@ def lookup_instrument_token(
     """
     Return the instrument_token for `symbol` on `exchange`.
 
-    Parameters
-    ----------
-    kite     : authenticated KiteConnect instance
-    symbol   : trading symbol, e.g. "RELIANCE", "NIFTY 50"
-    exchange : exchange segment, e.g. "NSE", "BSE", "NFO", "MCX"
+    Raises
+    ------
+    SymbolNotFoundError  if the symbol does not exist on the exchange.
+    KiteAPIError         if the instruments list cannot be fetched.
     """
-    instruments = kite.instruments(exchange=exchange)
+    try:
+        instruments = kite.instruments(exchange=exchange)
+    except Exception as exc:
+        raise KiteAPIError(
+            f"Failed to fetch instrument list for exchange '{exchange}': {exc}"
+        ) from exc
+
     symbol_upper = symbol.upper().strip()
 
-    matches = [
-        inst for inst in instruments
-        if inst["tradingsymbol"].upper() == symbol_upper
-    ]
+    try:
+        matches = [
+            inst for inst in instruments
+            if inst["tradingsymbol"].upper() == symbol_upper
+        ]
+    except Exception as exc:
+        raise KiteAPIError(
+            f"Error while searching instrument list: {exc}"
+        ) from exc
 
     if not matches:
-        # Provide a helpful list of close matches
         close = [
             inst["tradingsymbol"]
             for inst in instruments
             if symbol_upper in inst["tradingsymbol"].upper()
         ][:10]
         hint = f"\n  Possible matches: {close}" if close else ""
-        sys.exit(
-            f"ERROR: Symbol '{symbol}' not found on {exchange}.{hint}\n"
+        raise SymbolNotFoundError(
+            f"Symbol '{symbol}' not found on {exchange}.{hint}\n"
             f"Check the symbol name or try a different exchange (NSE, BSE, NFO, MCX)."
         )
 
@@ -78,8 +88,7 @@ def lookup_instrument_token(
             f"name='{matches[0]['name']}')."
         )
 
-    token: int = matches[0]["instrument_token"]
-    return token
+    return int(matches[0]["instrument_token"])
 
 
 def fetch_historical_data(
@@ -91,41 +100,37 @@ def fetch_historical_data(
     exchange: str = "NSE",
     continuous: bool = False,
     oi: bool = False,
-) -> pd.DataFrame:
+) -> tuple[pd.DataFrame, int]:
     """
-    Fetch OHLCV candle data for a symbol and return a DataFrame.
+    Fetch OHLCV candle data for a symbol and return a (DataFrame, token) tuple.
 
-    Parameters
-    ----------
-    kite       : authenticated KiteConnect instance
-    symbol     : trading symbol, e.g. "RELIANCE"
-    from_date  : start date  — "YYYY-MM-DD" string, date, or datetime
-    to_date    : end date    — "YYYY-MM-DD" string, date, or datetime
-    interval   : candle interval — one of VALID_INTERVALS
-    exchange   : exchange segment, default "NSE"
-    continuous : True for continuous data (futures/options)
-    oi         : True to include open interest column
-
-    Returns
-    -------
-    pd.DataFrame with columns: date, open, high, low, close, volume[, oi]
+    Raises
+    ------
+    InvalidIntervalError   if `interval` is not in VALID_INTERVALS.
+    ValueError             if from_date > to_date.
+    SymbolNotFoundError    if the symbol does not exist.
+    KiteAPIError           if the historical_data API call fails.
     """
     interval = interval.lower().strip()
     if interval not in VALID_INTERVALS:
-        sys.exit(
-            f"ERROR: Invalid interval '{interval}'. "
+        raise InvalidIntervalError(
+            f"Invalid interval '{interval}'. "
             f"Choose from: {sorted(VALID_INTERVALS)}"
         )
 
-    # Normalise dates to datetime objects for the SDK
-    from_dt = _to_datetime(from_date, is_start=True)
-    to_dt   = _to_datetime(to_date,   is_start=False)
+    try:
+        from_dt = _to_datetime(from_date, is_start=True)
+        to_dt   = _to_datetime(to_date,   is_start=False)
+    except ValueError:
+        raise
 
     if from_dt > to_dt:
-        sys.exit("ERROR: from_date must be earlier than to_date.")
+        raise ValueError(
+            f"from_date ({from_dt.date()}) must be earlier than to_date ({to_dt.date()})."
+        )
 
     delta_days = (to_dt - from_dt).days
-    max_days = INTERVAL_MAX_DAYS[interval]
+    max_days   = INTERVAL_MAX_DAYS[interval]
     if delta_days > max_days:
         print(
             f"WARNING: The requested range ({delta_days} days) exceeds the "
@@ -133,6 +138,7 @@ def fetch_historical_data(
             f"The API may return partial data or raise an error."
         )
 
+    # Raises SymbolNotFoundError / KiteAPIError if lookup fails
     instrument_token = lookup_instrument_token(kite, symbol, exchange)
 
     print(
@@ -141,23 +147,34 @@ def fetch_historical_data(
         f"[token={instrument_token}] …"
     )
 
-    records = kite.historical_data(
-        instrument_token=instrument_token,
-        from_date=from_dt,
-        to_date=to_dt,
-        interval=interval,
-        continuous=continuous,
-        oi=oi,
-    )
+    try:
+        records = kite.historical_data(
+            instrument_token=instrument_token,
+            from_date=from_dt,
+            to_date=to_dt,
+            interval=interval,
+            continuous=continuous,
+            oi=oi,
+        )
+    except Exception as exc:
+        raise KiteAPIError(
+            f"historical_data() failed for {symbol} ({exchange}) "
+            f"[{from_dt.date()} → {to_dt.date()}]: {exc}"
+        ) from exc
 
     if not records:
         print("No data returned for the given parameters.")
         return pd.DataFrame(), instrument_token
 
-    df = pd.DataFrame(records)
-    df["date"] = pd.to_datetime(df["date"])
-    df.set_index("date", inplace=True)
-    df.sort_index(inplace=True)
+    try:
+        df = pd.DataFrame(records)
+        df["date"] = pd.to_datetime(df["date"])
+        df.set_index("date", inplace=True)
+        df.sort_index(inplace=True)
+    except Exception as exc:
+        raise KiteAPIError(
+            f"Failed to parse historical data response for {symbol}: {exc}"
+        ) from exc
 
     print(f"Retrieved {len(df)} candles.")
     return df, instrument_token
@@ -179,11 +196,15 @@ def _to_datetime(value: Union[str, date, datetime], is_start: bool) -> datetime:
             try:
                 dt = datetime.strptime(value, fmt)
                 if fmt == "%Y-%m-%d":
-                    dt = dt.replace(hour=0 if is_start else 23,
-                                    minute=0 if is_start else 59,
-                                    second=0 if is_start else 59)
+                    dt = dt.replace(
+                        hour=0 if is_start else 23,
+                        minute=0 if is_start else 59,
+                        second=0 if is_start else 59,
+                    )
                 return dt
             except ValueError:
                 continue
-        sys.exit(f"ERROR: Cannot parse date '{value}'. Use 'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM:SS'.")
-    sys.exit(f"ERROR: Unsupported date type: {type(value)}")
+        raise ValueError(
+            f"Cannot parse date '{value}'. Use 'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM:SS'."
+        )
+    raise TypeError(f"Unsupported date type: {type(value)}")

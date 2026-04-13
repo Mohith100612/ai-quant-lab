@@ -5,15 +5,16 @@ Tables used:
   stock_data      — OHLCV candles keyed by (instrument_token, timestamp)
   fetch_log       — tracks which (symbol, exchange, interval, from_date, to_date)
                     queries have been fetched; used for exact-range duplicate detection
-  watched_symbols — symbols to poll every second during market hours
-  tick_data       — 1-second real-time snapshots captured during market hours
+  watched_symbols — symbols the WebSocket / REST ticker subscribes to
+  tick_data       — real-time tick snapshots (last_price, OHLC, volume,
+                    buy/sell qty, change%) stored by both the WS and REST tickers
 """
 
 from __future__ import annotations
 
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, date, timedelta
 from urllib.parse import urlparse
 
 import pandas as pd
@@ -101,6 +102,89 @@ def ensure_table() -> None:
     conn.commit()
     cursor.close()
     conn.close()
+
+
+def find_missing_date_ranges(
+    symbol: str,
+    exchange: str,
+    interval: str,
+    from_dt: datetime,
+    to_dt: datetime,
+) -> list[tuple[datetime, datetime]]:
+    """
+    Return a list of (start, end) datetime pairs representing date ranges
+    within [from_dt, to_dt] that have NOT yet been fetched and logged.
+
+    Example
+    -------
+    Requested : 2021-01-01 → 2026-04-10
+    In fetch_log: [2021-01-01 → 2022-12-31]  [2024-06-01 → 2026-04-10]
+    Returns   : [(2023-01-01, 2024-05-31)]   ← the gap in 2023/early 2024
+    """
+    conn   = _get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT from_date, to_date FROM fetch_log
+         WHERE symbol        = %s
+           AND exchange      = %s
+           AND interval_type = %s
+           AND from_date     <= %s
+           AND to_date       >= %s
+         ORDER BY from_date ASC
+        """,
+        (
+            symbol.upper(),
+            exchange.upper(),
+            interval,
+            to_dt.date(),
+            from_dt.date(),
+        ),
+    )
+    rows = cursor.fetchall()
+    cursor.close()
+    conn.close()
+
+    # Convert to (date, date) tuples and merge overlapping / adjacent ranges
+    fetched: list[tuple[date, date]] = [
+        (row["from_date"], row["to_date"]) for row in rows
+    ]
+
+    if not fetched:
+        return [(from_dt, to_dt)]
+
+    # Merge overlapping/adjacent fetched ranges
+    fetched.sort()
+    merged: list[tuple[date, date]] = [fetched[0]]
+    for start, end in fetched[1:]:
+        prev_start, prev_end = merged[-1]
+        if start <= prev_end + timedelta(days=1):
+            merged[-1] = (prev_start, max(prev_end, end))
+        else:
+            merged.append((start, end))
+
+    # Walk the timeline and collect gaps
+    gaps: list[tuple[datetime, datetime]] = []
+    cursor_date = from_dt.date()
+    target_end  = to_dt.date()
+
+    for seg_start, seg_end in merged:
+        if cursor_date < seg_start and cursor_date <= target_end:
+            gap_end = min(seg_start - timedelta(days=1), target_end)
+            gaps.append((
+                datetime.combine(cursor_date, datetime.min.time()),
+                datetime.combine(gap_end,     datetime.max.time().replace(microsecond=0)),
+            ))
+        cursor_date = max(cursor_date, seg_end + timedelta(days=1))
+
+    # Trailing gap after the last fetched segment
+    if cursor_date <= target_end:
+        gaps.append((
+            datetime.combine(cursor_date,  datetime.min.time()),
+            datetime.combine(target_end,   datetime.max.time().replace(microsecond=0)),
+        ))
+
+    return gaps
 
 
 def data_exists(
@@ -218,12 +302,35 @@ CREATE TABLE IF NOT EXISTS watched_symbols (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 """
 
+_CREATE_TICK_DATA_SQL = """
+CREATE TABLE IF NOT EXISTS tick_data (
+    id               BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    instrument_token INT             NOT NULL,
+    symbol           VARCHAR(50)     NOT NULL,
+    exchange         VARCHAR(20)     NOT NULL DEFAULT 'NSE',
+    captured_at      DATETIME(3)     NOT NULL,
+    last_price       DECIMAL(14,4)   NOT NULL,
+    open             DECIMAL(14,4),
+    high             DECIMAL(14,4),
+    low              DECIMAL(14,4),
+    close            DECIMAL(14,4),
+    volume           BIGINT          DEFAULT 0,
+    buy_quantity     INT             DEFAULT 0,
+    sell_quantity    INT             DEFAULT 0,
+    change_pct       DECIMAL(10,4),
+    PRIMARY KEY (id),
+    INDEX idx_symbol_time (symbol, captured_at),
+    INDEX idx_token_time  (instrument_token, captured_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+"""
+
 
 def ensure_tick_tables() -> None:
-    """Create watched_symbols table if it does not exist."""
+    """Create watched_symbols and tick_data tables if they do not exist."""
     conn   = _get_connection()
     cursor = conn.cursor()
     cursor.execute(_CREATE_WATCHED_SYMBOLS_SQL)
+    cursor.execute(_CREATE_TICK_DATA_SQL)
     conn.commit()
     cursor.close()
     conn.close()
@@ -285,11 +392,11 @@ def remove_watched_symbol(symbol: str, exchange: str = "NSE") -> bool:
 
 def save_ticks(ticks: list[dict]) -> int:
     """
-    Bulk-insert real-time 1-second tick snapshots into stock_data
-    (same table used for historical candles).
+    Bulk-insert real-time tick snapshots into tick_data.
 
     Each dict must have: symbol, instrument_token, captured_at, last_price
-    Optional keys:       open, high, low, close, volume
+    Optional keys:       exchange, open, high, low, close, volume,
+                         buy_quantity, sell_quantity, change
 
     Returns number of rows inserted.
     """
@@ -303,19 +410,26 @@ def save_ticks(ticks: list[dict]) -> int:
     for t in ticks:
         cursor.execute(
             """
-            INSERT IGNORE INTO stock_data
-                (instrument_token, symbol, timestamp, open, high, low, close, volume)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            INSERT INTO tick_data
+                (instrument_token, symbol, exchange, captured_at,
+                 last_price, open, high, low, close,
+                 volume, buy_quantity, sell_quantity, change_pct)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
                 int(t["instrument_token"]),
                 t["symbol"].upper(),
+                t.get("exchange", "NSE").upper(),
                 t["captured_at"],
-                float(t["open"])  if t.get("open")  is not None else float(t["last_price"]),
-                float(t["high"])  if t.get("high")  is not None else float(t["last_price"]),
-                float(t["low"])   if t.get("low")   is not None else float(t["last_price"]),
                 float(t["last_price"]),
+                float(t["open"])   if t.get("open")   is not None else None,
+                float(t["high"])   if t.get("high")   is not None else None,
+                float(t["low"])    if t.get("low")    is not None else None,
+                float(t["close"])  if t.get("close")  is not None else None,
                 int(t.get("volume") or 0),
+                int(t.get("buy_quantity") or 0),
+                int(t.get("sell_quantity") or 0),
+                float(t["change"]) if t.get("change") is not None else None,
             ),
         )
         rows_inserted += cursor.rowcount
@@ -324,3 +438,36 @@ def save_ticks(ticks: list[dict]) -> int:
     cursor.close()
     conn.close()
     return rows_inserted
+
+
+def query_tick_data(
+    symbol: str,
+    from_dt: datetime,
+    to_dt: datetime,
+    limit: int = 3600,
+) -> list[dict]:
+    """
+    Return tick_data rows for a symbol within the given time range.
+
+    Rows are ordered oldest-first and capped at `limit` (default 3600 = 1 hour
+    of 1-second ticks).
+    """
+    conn   = _get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT instrument_token, symbol, exchange, captured_at,
+               last_price, open, high, low, close,
+               volume, buy_quantity, sell_quantity, change_pct
+          FROM tick_data
+         WHERE symbol      = %s
+           AND captured_at BETWEEN %s AND %s
+         ORDER BY captured_at ASC
+         LIMIT %s
+        """,
+        (symbol.upper(), from_dt, to_dt, limit),
+    )
+    rows = cursor.fetchall()
+    cursor.close()
+    conn.close()
+    return list(rows)
