@@ -42,7 +42,7 @@ from database import (
     get_watched_symbols, add_watched_symbol, remove_watched_symbol,
     get_enriched_candles,
 )
-from ticker import ticker_manager
+from ws_ticker import ws_ticker_manager as ticker_manager
 
 logger = logging.getLogger(__name__)
 
@@ -314,7 +314,7 @@ def list_watched_symbols():
 def start_ticker():
     """Manually start real-time polling (without waiting for 09:15 IST)."""
     try:
-        status = ticker_manager.start_polling()
+        status = ticker_manager.start()
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
     return {"status": status}
@@ -323,22 +323,28 @@ def start_ticker():
 @app.post("/ticker/stop", tags=["Ticker"])
 def stop_ticker():
     """Manually stop real-time polling."""
-    return {"status": ticker_manager.stop_polling()}
+    return {"status": ticker_manager.stop()}
 
 
 @app.get("/ticker/status", tags=["Ticker"])
 def ticker_status():
-    """Return whether the ticker is running and how many symbols are watched."""
+    """Return whether the ticker is running and live metrics."""
     try:
         count = len(get_watched_symbols())
     except Exception:
         count = 0
     return {
-        "polling_active":   ticker_manager.is_running,
-        "scheduler_active": ticker_manager.scheduler_running,
-        "watched_count":    count,
-        "auto_start":       "09:15 IST (Mon–Fri)",
-        "auto_stop":        "15:30 IST (Mon–Fri)",
+        "polling_active":    ticker_manager.is_running,
+        "scheduler_active":  ticker_manager.scheduler_running,
+        "ws_connected":      ticker_manager.is_connected,
+        "watched_count":     count,
+        "ticks_stored":      ticker_manager.ticks_stored,
+        "ticks_dropped":     ticker_manager.ticks_dropped,
+        "queue_depth":       ticker_manager.queue_depth,
+        "last_tick_at":      ticker_manager.last_tick_at,
+        "subscribed_symbols": ticker_manager.subscribed_symbols,
+        "auto_start":        "09:15 IST (Mon–Fri)",
+        "auto_stop":         "15:30 IST (Mon–Fri)",
     }
 
 
@@ -348,12 +354,12 @@ def ticker_status():
 
 @app.get("/ticks", tags=["Ticks"])
 def get_ticks(
-    symbol:  str = Query(...,   description="Trading symbol e.g. MRF"),
+    symbol:  str = Query(...,   description="Trading symbol e.g. RELIANCE"),
     from_dt: str = Query(...,   alias="from", description="Start: YYYY-MM-DD or YYYY-MM-DD HH:MM:SS"),
     to_dt:   str = Query(...,   alias="to",   description="End:   YYYY-MM-DD or YYYY-MM-DD HH:MM:SS"),
     limit:   int = Query(3600,  description="Max rows (default 3600 = 1 hour, max 86400)", ge=1, le=86400),
 ):
-    """Query real-time 1-second tick snapshots from stock_data for a symbol within a time range."""
+    """Query real-time 1-second tick snapshots from tick_data for a symbol within a time range."""
     try:
         from_parsed = _to_datetime(from_dt, is_start=True)
         to_parsed   = _to_datetime(to_dt,   is_start=False)
@@ -370,12 +376,13 @@ def get_ticks(
             cursor = conn.cursor()
             cursor.execute(
                 """
-                SELECT instrument_token, symbol, timestamp,
-                       open, high, low, close, volume
-                  FROM stock_data
-                 WHERE symbol    = %s
-                   AND timestamp BETWEEN %s AND %s
-                 ORDER BY timestamp ASC
+                SELECT instrument_token, symbol, exchange, captured_at,
+                       last_price, open, high, low, close, volume,
+                       buy_quantity, sell_quantity, change_pct, oi
+                  FROM tick_data
+                 WHERE symbol      = %s
+                   AND captured_at BETWEEN %s AND %s
+                 ORDER BY captured_at ASC
                  LIMIT %s
                 """,
                 (symbol.upper(), from_parsed, to_parsed, limit),
@@ -387,13 +394,19 @@ def get_ticks(
 
     ticks = [
         {
-            "timestamp":        row["timestamp"].isoformat() if hasattr(row["timestamp"], "isoformat") else str(row["timestamp"]),
-            "open":             float(row["open"])   if row["open"]   is not None else None,
-            "high":             float(row["high"])   if row["high"]   is not None else None,
-            "low":              float(row["low"])    if row["low"]    is not None else None,
-            "close":            float(row["close"])  if row["close"]  is not None else None,
-            "volume":           int(row["volume"])   if row["volume"] is not None else 0,
+            "captured_at":      row["captured_at"].isoformat() if hasattr(row["captured_at"], "isoformat") else str(row["captured_at"]),
+            "last_price":       float(row["last_price"]),
+            "open":             float(row["open"])        if row["open"]        is not None else None,
+            "high":             float(row["high"])        if row["high"]        is not None else None,
+            "low":              float(row["low"])         if row["low"]         is not None else None,
+            "close":            float(row["close"])       if row["close"]       is not None else None,
+            "volume":           int(row["volume"])        if row["volume"]      is not None else 0,
+            "buy_quantity":     int(row["buy_quantity"])  if row["buy_quantity"]  is not None else 0,
+            "sell_quantity":    int(row["sell_quantity"]) if row["sell_quantity"] is not None else 0,
+            "change_pct":       float(row["change_pct"]) if row["change_pct"]  is not None else None,
+            "oi":               int(row["oi"])            if row["oi"]          is not None else 0,
             "instrument_token": int(row["instrument_token"]),
+            "exchange":         row["exchange"],
         }
         for row in rows
     ]
