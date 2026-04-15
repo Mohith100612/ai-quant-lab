@@ -706,8 +706,8 @@ def _normalize_ticks(
     token_meta: dict[int, dict],
 ) -> list[dict]:
     """Map KiteTicker wire format → save_ticks() dict format."""
-    captured_at = datetime.now(IST).replace(tzinfo=None)
-    result      = []
+    fallback_captured_at = datetime.now(IST).replace(tzinfo=None)
+    result               = []
 
     for t in raw_ticks:
         token = t.get("instrument_token", 0)
@@ -720,6 +720,13 @@ def _normalize_ticks(
             if dt is None:
                 return None
             return dt.replace(tzinfo=None) if hasattr(dt, "tzinfo") else dt
+
+        # Use exchange_timestamp per tick so each row gets its true event time.
+        # Fall back to last_trade_time, then to a single wall-clock snapshot if
+        # neither is present (e.g. LTP-mode ticks that omit full metadata).
+        exchange_ts   = _strip_tz(t.get("exchange_timestamp"))
+        last_trade_ts = _strip_tz(t.get("last_trade_time"))
+        captured_at   = exchange_ts or last_trade_ts or fallback_captured_at
 
         result.append({
             "symbol":                meta.get("symbol", str(token)),
@@ -739,8 +746,8 @@ def _normalize_ticks(
             "oi":                    t.get("oi", 0),
             "oi_day_high":           t.get("oi_day_high", 0),
             "oi_day_low":            t.get("oi_day_low", 0),
-            "last_trade_time":       _strip_tz(t.get("last_trade_time")),
-            "exchange_timestamp":    _strip_tz(t.get("exchange_timestamp")),
+            "last_trade_time":       last_trade_ts,
+            "exchange_timestamp":    exchange_ts,
             "depth":                 t.get("depth"),
             "captured_at":           captured_at,
         })

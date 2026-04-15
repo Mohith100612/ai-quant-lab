@@ -567,6 +567,7 @@ CREATE TABLE IF NOT EXISTS tick_data (
     last_trade_time      DATETIME(3),
     exchange_timestamp   DATETIME(3),
     depth                JSON,
+    UNIQUE KEY uq_tick (instrument_token, captured_at, last_price),
     INDEX idx_symbol_captured (symbol, captured_at),
     INDEX idx_token_captured  (instrument_token, captured_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
@@ -705,7 +706,7 @@ def save_ticks(ticks: list[dict]) -> int:
                 depth = t.get("depth")
                 cursor.execute(
                     """
-                    INSERT INTO tick_data
+                    INSERT IGNORE INTO tick_data
                         (instrument_token, symbol, exchange, captured_at,
                          last_price, open, high, low, close,
                          volume, buy_quantity, sell_quantity, change_pct,
